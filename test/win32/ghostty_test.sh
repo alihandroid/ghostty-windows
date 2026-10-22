@@ -653,6 +653,67 @@ else{Write-Output "BROWSER_OPENED=false"}
     ps -Action kill -ProcessId "$pid" 2>/dev/null || true
 }
 
+test_auto_update_settings() {
+    echo "▶ test_auto_update_settings"
+    local failures_before=$FAIL
+    local mode test_root timestamp args output pid window_found
+    for mode in unset off check download; do
+        test_root="$(mktemp -d "$(wslpath "$WIN_TEMP")/ghostty-update-check.XXXXXX")"
+        timestamp="$test_root/ghostty/update_check_at"
+        args="--config-default-files=false --command=cmd.exe --keybind=ctrl+shift+u=check_for_updates"
+        if [ "$mode" != "unset" ]; then
+            args+=" --auto-update=$mode"
+        fi
+
+        # Each child gets an isolated LOCALAPPDATA; never alter the user's
+        # config or persisted update timestamp.
+        GHOSTTY_HWND=0
+        LOCALAPPDATA="$(wslpath -w "$test_root")" \
+            WSLENV="${WSLENV:+$WSLENV:}LOCALAPPDATA/w" \
+            launch_and_set_hwnd 5000 "$args"
+        output="$LAUNCH_OUTPUT"
+        pid="$(get_val "$output" PID)"
+        window_found="$(get_val "$output" WINDOW_FOUND)"
+        if [ "$window_found" != "true" ]; then
+            echo "  ✗ Window did not appear (auto-update=$mode)"
+            FAIL=$((FAIL + 1))
+            ps -Action kill -ProcessId "$pid" 2>/dev/null || true
+            rm -rf -- "$test_root"
+            continue
+        fi
+
+        local present=false expected=true
+        [ -s "$timestamp" ] && present=true
+        [ "$mode" = "off" ] && expected=false
+        assert_eq "Startup check with auto-update=$mode" "$expected" "$present" || true
+
+        # A recent timestamp must not prevent an explicit check, including
+        # when automatic checks are disabled. This observes the attempt
+        # before the network request, so it needs no GitHub connectivity.
+        local recent checked="" refreshed=false attempt
+        recent=$(($(date +%s) - 60))
+        mkdir -p "$test_root/ghostty"
+        printf '%s\n' "$recent" > "$timestamp"
+        ps -Action sendkeys -ProcessId "$pid" -Keys "^+u"
+        for ((attempt = 0; attempt < 20; attempt++)); do
+            checked="$(<"$timestamp")"
+            if [[ "$checked" =~ ^[0-9]+$ ]] && [ "$checked" -gt "$recent" ]; then
+                refreshed=true
+                break
+            fi
+            sleep 0.1
+        done
+        assert_eq "Manual check bypasses throttle with auto-update=$mode" "true" "$refreshed" || true
+        ps -Action kill -ProcessId "$pid" 2>/dev/null || true
+        rm -rf -- "$test_root"
+    done
+
+    if [ "$FAIL" -eq "$failures_before" ]; then
+        PASS=$((PASS + 1))
+        echo "  ● PASSED"
+    fi
+}
+
 test_notifications() {
     echo "▶ test_notifications"
     local output
@@ -1645,6 +1706,7 @@ list_tests() {
     echo "  scrollbar           — Auto-hide overlay scrollbar fade-in/out lifecycle"
     echo "  close_confirmation  — Close blocked by confirmation dialog"
     echo "  url_detection       — URL displayed in terminal for Ctrl+click"
+    echo "  auto_update_settings — Automatic update modes and forced manual checks"
     echo "  notifications      — Desktop notification via OSC 9"
     echo "  window_size_config — Custom window size from config"
     echo "  search             — Search bar open/close/input"
@@ -1678,6 +1740,7 @@ run_test() {
         scrollbar)           test_scrollbar ;;
         close_confirmation)  test_close_confirmation ;;
         url_detection)       test_url_detection ;;
+        auto_update_settings) test_auto_update_settings ;;
         notifications)       test_notifications ;;
         window_size_config)  test_window_size_config ;;
         search)              test_search ;;
@@ -1730,6 +1793,8 @@ case "${1:-all}" in
         test_close_confirmation
         echo ""
         test_url_detection
+        echo ""
+        test_auto_update_settings
         echo ""
         test_notifications
         echo ""

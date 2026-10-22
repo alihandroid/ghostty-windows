@@ -3893,9 +3893,14 @@ term: []const u8 = "xterm-ghostty",
 /// Available since: 1.2.0
 @"async-backend": AsyncBackend = .auto,
 
-/// Control the auto-update functionality of Ghostty. This is only supported
-/// on macOS currently, since Linux builds are distributed via package
-/// managers that are not centrally controlled by Ghostty.
+/// Control the auto-update functionality of Ghostty. This is supported on
+/// macOS and Windows. Linux builds are distributed via package managers
+/// that are not centrally controlled by Ghostty.
+///
+/// On Windows, automatic checks run at startup, at most once per hour.
+/// `download` behaves like `check`; updates are not downloaded or installed
+/// automatically. If unset, automatic checks are enabled. An explicit
+/// `check_for_updates` action always checks, even with `off` or a recent check.
 ///
 /// Checking or downloading an update does not send any information to
 /// the project beyond standard network information mandated by the
@@ -3912,10 +3917,10 @@ term: []const u8 = "xterm-ghostty",
 ///  * `download` - Check for updates, automatically download the update,
 ///    notify the user, but do not automatically install the update.
 ///
-/// If unset, we defer to Sparkle's default behavior, which respects the
+/// On macOS, if unset, we defer to Sparkle's default behavior, which respects the
 /// preference stored in the standard user defaults (`defaults(1)`).
 ///
-/// Changing this value at runtime works after a small delay.
+/// On macOS, changing this value at runtime works after a small delay.
 @"auto-update": ?AutoUpdate = null,
 
 /// The release channel to use for auto-updates.

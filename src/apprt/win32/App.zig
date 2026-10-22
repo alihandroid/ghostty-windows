@@ -241,7 +241,7 @@ pub fn init(
     self.registerGlobalHotkey();
 
     // Check for updates in the background (non-blocking).
-    self.startUpdateCheck();
+    self.startUpdateCheck(false);
 }
 
 pub fn run(self: *App) !void {
@@ -1380,7 +1380,7 @@ pub fn performAction(
         },
 
         .check_for_updates => {
-            self.startUpdateCheck();
+            self.startUpdateCheck(true);
             return true;
         },
 
@@ -1748,20 +1748,30 @@ const UPDATE_CHECK_INTERVAL_SECS: i64 = 60 * 60; // 1 hour
 /// fetch if we checked within the last UPDATE_CHECK_INTERVAL_SECS.
 /// Manual `.check_for_updates` actions force-refresh by setting
 /// `force=true`.
-fn startUpdateCheck(self: *App) void {
-    if (!self.shouldRunUpdateCheck()) {
+fn startUpdateCheck(self: *App, force: bool) void {
+    if (!force) {
+        if (self.config.@"auto-update") |mode| {
+            if (mode == .off) {
+                log.debug("skipping update check (auto-update=off)", .{});
+                return;
+            }
+        }
+    }
+    if (!self.shouldRunUpdateCheck(force)) {
         log.debug("skipping update check (last run within {d}s)", .{UPDATE_CHECK_INTERVAL_SECS});
         return;
     }
-    _ = std.Thread.spawn(.{}, updateCheckThread, .{self}) catch |err| {
+    const thread = std.Thread.spawn(.{}, updateCheckThread, .{self}) catch |err| {
         log.warn("failed to start update check thread: {}", .{err});
+        return;
     };
+    thread.detach();
 }
 
 /// Read the persisted "last checked at" timestamp; return true if
 /// it's missing/stale. Updates the file with the current timestamp on
 /// the way out so a successful return throttles the next call.
-fn shouldRunUpdateCheck(self: *App) bool {
+fn shouldRunUpdateCheck(self: *App, force: bool) bool {
     const alloc = self.core_app.alloc;
     const io = global.io();
     const dir = global.environ().getAlloc(alloc, "LOCALAPPDATA") catch return true;
@@ -1769,12 +1779,19 @@ fn shouldRunUpdateCheck(self: *App) bool {
     const path = std.fs.path.join(alloc, &.{ dir, "ghostty", "update_check_at" }) catch return true;
     defer alloc.free(path);
 
-    const now = std.Io.Clock.now(.real, io).toSeconds();
+    return shouldRunUpdateCheckAt(alloc, path, std.Io.Clock.now(.real, io).toSeconds(), force);
+}
+
+fn shouldRunUpdateCheckAt(alloc: Allocator, path: []const u8, now: i64, force: bool) bool {
+    const io = global.io();
     if (std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(32))) |contents| {
         defer alloc.free(contents);
         const text = std.mem.trim(u8, contents, " \t\r\n");
         if (std.fmt.parseInt(i64, text, 10)) |last| {
-            if (now - last < UPDATE_CHECK_INTERVAL_SECS) return false;
+            // A future timestamp (e.g. after a clock adjustment) must not
+            // suppress checks indefinitely. Saturation handles old or
+            // malformed extreme timestamps without overflowing in Debug.
+            if (!force and last <= now and now -| last < UPDATE_CHECK_INTERVAL_SECS) return false;
         } else |_| {}
     } else |_| {}
 
@@ -2701,4 +2718,61 @@ test "open URL frees undelivered requests" {
         .kind = .osc8,
         .url = "https://example.com/\xff",
     }));
+}
+
+test "update check off skips startup before accessing application state" {
+    var app: App = undefined;
+    app.config.@"auto-update" = .off;
+    // No core_app or message window is needed when checks are disabled.
+    app.startUpdateCheck(false);
+}
+
+test "update check timestamp throttles automatic checks and manual checks refresh" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(root);
+    const path = try std.fs.path.join(alloc, &.{ root, "ghostty", "update_check_at" });
+    defer alloc.free(path);
+
+    const now: i64 = 1_800_000_000;
+    try testing.expect(shouldRunUpdateCheckAt(alloc, path, now, false));
+    try testing.expect(!shouldRunUpdateCheckAt(alloc, path, now + 1, false));
+    try testing.expect(!shouldRunUpdateCheckAt(alloc, path, now + UPDATE_CHECK_INTERVAL_SECS - 1, false));
+    {
+        const contents = try std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(32));
+        defer alloc.free(contents);
+        try testing.expectEqual(now, try std.fmt.parseInt(i64, contents, 10));
+    }
+    try testing.expect(shouldRunUpdateCheckAt(alloc, path, now + UPDATE_CHECK_INTERVAL_SECS, false));
+    try testing.expect(shouldRunUpdateCheckAt(alloc, path, now + UPDATE_CHECK_INTERVAL_SECS + 1, true));
+    {
+        const contents = try std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(32));
+        defer alloc.free(contents);
+        try testing.expectEqual(now + UPDATE_CHECK_INTERVAL_SECS + 1, try std.fmt.parseInt(i64, contents, 10));
+    }
+}
+
+test "update check recovers from invalid and future timestamps" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(root);
+    const path = try std.fs.path.join(alloc, &.{ root, "update_check_at" });
+    defer alloc.free(path);
+
+    const now: i64 = 1_800_000_000;
+    for ([_][]const u8{ "", "invalid", "1800000001", "9223372036854775807", "-9223372036854775808" }) |text| {
+        try tmp.dir.writeFile(io, .{ .sub_path = "update_check_at", .data = text });
+        try testing.expect(shouldRunUpdateCheckAt(alloc, path, now, false));
+        const contents = try tmp.dir.readFileAlloc(io, "update_check_at", alloc, .limited(32));
+        defer alloc.free(contents);
+        try testing.expectEqual(now, try std.fmt.parseInt(i64, contents, 10));
+    }
 }
