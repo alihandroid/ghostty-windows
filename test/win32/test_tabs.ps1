@@ -1,5 +1,9 @@
 param([string]$ExePath, [string]$ScreenshotDir = "")
 
+if ($env:GHOSTTY_TEST_ISOLATED_DESKTOP -ne "1") {
+    throw "This test injects global input. Use a dedicated desktop and set GHOSTTY_TEST_ISOLATED_DESKTOP=1."
+}
+
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 Add-Type @"

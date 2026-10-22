@@ -712,7 +712,7 @@ fn scrollbarWndProc(
             return 0;
         },
 
-        WM_GHOSTTY_SCROLLBAR_QUERY => return @intFromEnum(self.visibility),
+        WM_GHOSTTY_SCROLLBAR_QUERY => return @backingInt(self.visibility),
 
         else => return w32.DefWindowProcW(hwnd, msg, wparam, lparam),
     }

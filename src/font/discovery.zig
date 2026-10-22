@@ -18,7 +18,7 @@ const log = std.log.scoped(.discovery);
 
 /// Discover implementation for the compile options.
 pub const Discover = switch (options.backend) {
-    .freetype => if (builtin.os.tag == .windows) DirectWrite else void,
+    .freetype => if (builtin.target.os.tag == .windows) DirectWrite else void,
     .freetype_windows => Windows,
     .fontconfig_freetype => Fontconfig,
     .web_canvas => void, // no discovery
@@ -106,8 +106,8 @@ pub const Descriptor = struct {
         // cleaned up somewhere else.
 
         var copy = self.*;
-        copy.family = if (self.family) |src| try alloc.dupeZ(u8, src) else null;
-        copy.style = if (self.style) |src| try alloc.dupeZ(u8, src) else null;
+        copy.family = if (self.family) |src| try alloc.dupeSentinel(u8, src, 0) else null;
+        copy.style = if (self.style) |src| try alloc.dupeSentinel(u8, src, 0) else null;
         copy.variations = try alloc.dupe(Variation, self.variations);
         return copy;
     }
@@ -136,12 +136,12 @@ pub const Descriptor = struct {
         ));
         if (self.bold) assert(pat.add(
             .weight,
-            .{ .integer = @intFromEnum(fontconfig.Weight.bold) },
+            .{ .integer = @backingInt(fontconfig.Weight.bold) },
             false,
         ));
         if (self.italic) assert(pat.add(
             .slant,
-            .{ .integer = @intFromEnum(fontconfig.Slant.italic) },
+            .{ .integer = @backingInt(fontconfig.Slant.italic) },
             false,
         ));
 
@@ -150,7 +150,7 @@ pub const Descriptor = struct {
         // exclude non-monospace but helps prefer it.
         assert(pat.add(
             .spacing,
-            .{ .integer = @intFromEnum(fontconfig.Spacing.mono) },
+            .{ .integer = @backingInt(fontconfig.Spacing.mono) },
             false,
         ));
 
@@ -359,7 +359,7 @@ pub const DirectWrite = struct {
                 // Get family name for this result
                 const family_names = font_family.getFamilyNames() catch continue;
                 defer family_names.release();
-                const name = family_names.getLocalizedName(alloc) catch alloc.dupeZ(u8, family) catch continue;
+                const name = family_names.getLocalizedName(alloc) catch alloc.dupeSentinel(u8, family, 0) catch continue;
 
                 // AddRef to create a second reference for the result
                 // (defer above releases our local reference)
@@ -490,7 +490,7 @@ pub const DirectWrite = struct {
 
         // Weight matching
         const desired_weight: u32 = if (desc.bold) 700 else 400;
-        const actual_weight = @intFromEnum(result.weight);
+        const actual_weight = @backingInt(result.weight);
         const weight_diff: i32 = @intCast(@as(u32, @intCast(@abs(@as(i64, @intCast(actual_weight)) - @as(i64, @intCast(desired_weight))))));
         score -= weight_diff;
 
@@ -1196,7 +1196,7 @@ pub const CoreText = struct {
             const fuzzy_type = @TypeOf(self.fuzzy_style);
             self.fuzzy_style = @intCast(style_str.len);
             for (desired_styles) |s| {
-                if (std.ascii.indexOfIgnoreCase(style_str, s) != null) {
+                if (std.ascii.findIgnoreCase(style_str, s) != null) {
                     self.fuzzy_style -|= @intCast(s.len);
                 }
             }
@@ -1403,8 +1403,7 @@ pub const Windows = struct {
                 "SYSTEMROOT",
             ) catch return null;
             defer self.alloc.free(systemroot);
-            return std.fmt.allocPrintSentinel(
-                self.alloc,
+            return self.alloc.printSentinel(
                 "{s}\\Fonts",
                 .{systemroot},
                 0,
@@ -1417,8 +1416,7 @@ pub const Windows = struct {
                 "LOCALAPPDATA",
             ) catch return null;
             defer self.alloc.free(local_appdata);
-            return std.fmt.allocPrintSentinel(
-                self.alloc,
+            return self.alloc.printSentinel(
                 "{s}\\Microsoft\\Windows\\Fonts",
                 .{local_appdata},
                 0,
@@ -1435,11 +1433,12 @@ pub const Windows = struct {
                 .done => return null,
             };
 
-            var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-            const full_path = std.fmt.bufPrintZ(
+            var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+            const full_path = std.mem.printSentinel(
                 &path_buf,
                 "{s}\\{s}",
                 .{ dir_path, name },
+                0,
             ) catch return null;
 
             const is_ttc = std.ascii.endsWithIgnoreCase(name, ".ttc");
@@ -1482,7 +1481,7 @@ pub const Windows = struct {
             full_path: []const u8,
             face_index: i32,
         ) !DeferredFace {
-            const path_owned = try self.alloc.dupeZ(u8, full_path);
+            const path_owned = try self.alloc.dupeSentinel(u8, full_path, 0);
             errdefer self.alloc.free(path_owned);
 
             const presentation: Presentation =

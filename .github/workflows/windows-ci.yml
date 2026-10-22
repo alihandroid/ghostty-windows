@@ -36,7 +36,7 @@ jobs:
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           # Pinned to build.zig.zon's minimum_zig_version.
-          version: 0.16.0
+          version: 0.17.0
 
       # GitHub-hosted windows-latest runs Windows Defender, whose real-time
       # scanning transiently locks freshly-created files. That makes
@@ -57,12 +57,29 @@ jobs:
       # runtime. We target the GNU ABI because the MSVC ABI can't yet
       # locate the MSVC libc/c++ headers under Zig; this matches the
       # invocation verified on the Windows command-quoting fix.
+      - name: Verify shared-desktop input safety
+        shell: pwsh
+        run: |
+          $env:GHOSTTY_TEST_ISOLATED_DESKTOP = "0"
+          foreach ($action in @("sendkeys", "sendtext")) {
+            $output = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File test/win32/test_harness.ps1 -Action $action 2>&1
+            if ($LASTEXITCODE -eq 0 -or "$output" -notmatch "Global keyboard injection is disabled") {
+              throw "The test harness did not refuse global input ($action)"
+            }
+          }
+          # The refusals are expected failures. GitHub's pwsh wrapper would
+          # otherwise propagate the last child process's exit code.
+          $global:LASTEXITCODE = 0
+
       - name: Test
         run: zig build test -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu
 
       # Full app build, which also compiles dist/windows/ghostty.rc.
       - name: Build
         run: zig build -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu
+
+      - name: Build stripped release
+        run: zig build -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu -Doptimize=fast
 
   fmt:
     name: zig fmt
@@ -75,7 +92,7 @@ jobs:
       - name: Setup Zig
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
-          version: 0.16.0
+          version: 0.17.0
 
       - name: zig fmt
         run: zig fmt --check .

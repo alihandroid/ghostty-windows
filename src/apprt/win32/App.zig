@@ -17,6 +17,17 @@ const Surface = @import("Surface.zig");
 const Window = @import("Window.zig");
 const SplitTree = @import("../../datastruct/split_tree.zig").SplitTree;
 const w32 = @import("win32.zig");
+const UntrustedUrl = @import("UntrustedUrl.zig");
+
+const OpenUrlRequest = struct {
+    kind: apprt.action.OpenUrl.Kind,
+    url: []u8,
+
+    fn deinit(self: *OpenUrlRequest, alloc: Allocator) void {
+        alloc.free(self.url);
+        alloc.destroy(self);
+    }
+};
 
 const build_config = @import("../../build_config.zig");
 const input = @import("../../input.zig");
@@ -680,10 +691,13 @@ pub fn performAction(
                 log.warn("oom allocating url to open", .{});
                 return true;
             };
-            const wparam: usize = @intFromPtr(owned.ptr);
-            const lparam: isize = @intCast(owned.len);
-            if (w32.PostMessageW(hwnd, WM_APP_OPEN_URL, wparam, lparam) == 0) {
+            const request = alloc.create(OpenUrlRequest) catch {
                 alloc.free(owned);
+                return true;
+            };
+            request.* = .{ .kind = value.kind, .url = owned };
+            if (w32.PostMessageW(hwnd, WM_APP_OPEN_URL, @intFromPtr(request), 0) == 0) {
+                request.deinit(alloc);
             }
             return true;
         },
@@ -856,6 +870,13 @@ pub fn performAction(
             return true;
         },
 
+        .resize_window => {
+            return switch (target) {
+                .app => false,
+                .surface => |core| core.rt_surface.parent_window.resizeSurface(core.rt_surface, value),
+            };
+        },
+
         .reload_config => {
             // Reload config and push to the core, which triggers
             // config_change actions on all surfaces.
@@ -888,7 +909,7 @@ pub fn performAction(
                         // Show a message box including the actual exit code.
                         const hwnd_val = core_surface.rt_surface.parent_window.hwnd;
                         var utf8_buf: [128]u8 = undefined;
-                        const msg_utf8 = std.fmt.bufPrint(
+                        const msg_utf8 = std.mem.print(
                             &utf8_buf,
                             "The shell process exited with code {d}.",
                             .{exit_code},
@@ -1014,7 +1035,7 @@ pub fn performAction(
                             if (utf8_len > 0) {
                                 // Copy to clipboard via the core surface
                                 const alloc = self.core_app.alloc;
-                                const text = alloc.dupeZ(u8, utf8_buf[0..utf8_len]) catch return true;
+                                const text = alloc.dupeSentinel(u8, utf8_buf[0..utf8_len], 0) catch return true;
                                 defer alloc.free(text);
                                 core_surface.rt_surface.setClipboard(
                                     .standard,
@@ -1244,13 +1265,13 @@ pub fn performAction(
                             "Command Finished";
                         var body_buf: [128]u8 = undefined;
                         const body: []const u8 = if (value.exit_code) |code|
-                            std.fmt.bufPrint(
+                            std.mem.print(
                                 &body_buf,
                                 "Command took {f} and exited with code {d}.",
                                 .{ value.duration.round(std.time.ns_per_ms), code },
                             ) catch "Command finished."
                         else
-                            std.fmt.bufPrint(
+                            std.mem.print(
                                 &body_buf,
                                 "Command took {f}.",
                                 .{value.duration.round(std.time.ns_per_ms)},
@@ -1417,7 +1438,7 @@ pub fn performAction(
             return true;
         },
 
-        // All 66 apprt actions are now handled above.
+        // Keep this exhaustive so upstream action additions require review.
     }
 }
 
@@ -1453,8 +1474,7 @@ fn openConfigInNewWindow(self: *App, path: [:0]const u8) !bool {
 
     // Windows paths cannot contain a double quote, so quoting the path is
     // sufficient while leaving editor arguments supplied by the user intact.
-    const command_text = try std.fmt.allocPrintSentinel(
-        alloc,
+    const command_text = try alloc.printSentinel(
         "{s} \"{s}\"",
         .{ editor, path },
         0,
@@ -1462,8 +1482,7 @@ fn openConfigInNewWindow(self: *App, path: [:0]const u8) !bool {
     defer alloc.free(command_text);
     const command: configpkg.Command = .{ .shell = command_text };
 
-    const title = try std.fmt.allocPrintSentinel(
-        alloc,
+    const title = try alloc.printSentinel(
         "Editing configuration file {s}",
         .{path},
         0,
@@ -1798,7 +1817,7 @@ fn shouldRunUpdateCheckAt(alloc: Allocator, path: []const u8, now: i64, force: b
     // Write (or create) the file with the current timestamp.
     std.Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(path) orelse return true) catch {};
     var ts_buf: [32]u8 = undefined;
-    const s = std.fmt.bufPrint(&ts_buf, "{d}", .{now}) catch return true;
+    const s = std.mem.print(&ts_buf, "{d}", .{now}) catch return true;
     std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = s }) catch {};
     return true;
 }
@@ -1889,7 +1908,7 @@ fn showUpdateNotification(self: *App, ver: []const u8) void {
 
     // Body: "Version X.Y.Z is available. Visit GitHub to download."
     var body_utf8: [256]u8 = undefined;
-    const body_len = std.fmt.bufPrint(&body_utf8, "Version {s} is available.\nVisit GitHub releases to download.", .{ver[0..ver_len]}) catch return;
+    const body_len = std.mem.print(&body_utf8, "Version {s} is available.\nVisit GitHub releases to download.", .{ver[0..ver_len]}) catch return;
     var body_utf16: [256]u16 = undefined;
     const wlen = std.unicode.utf8ToUtf16Le(&body_utf16, body_len) catch 0;
     @memcpy(nid.szInfo[0..wlen], body_utf16[0..wlen]);
@@ -2457,11 +2476,27 @@ fn surfaceWndProc(
 /// Open a URL in the default handler. internal_os.open() uses
 /// std.process.Child which can hit unreachable on Windows, so we use
 /// ShellExecuteW directly.
-fn openUrlNow(url: []const u8) void {
+fn openUrlNow(value: apprt.action.OpenUrl) void {
+    const decision = UntrustedUrl.decide(value);
+    if (decision == .deny) {
+        log.warn("blocked unsafe terminal URL", .{});
+        return;
+    }
+    const url = value.url;
     var wbuf: [2048]u16 = undefined;
     const wlen = std.unicode.utf8ToUtf16Le(&wbuf, url) catch return;
     if (wlen >= wbuf.len) return;
     wbuf[wlen] = 0;
+    if (decision == .confirm) {
+        var prompt_buf: [8192]u8 = undefined;
+        const prompt = std.mem.print(&prompt_buf, "Open this terminal-supplied link in its registered application?\n" ++
+            "This may execute commands. Continue only if you trust the target.\n\n{s}", .{url}) catch return;
+        var wide_prompt: [8192]u16 = undefined;
+        const prompt_len = std.unicode.utf8ToUtf16Le(&wide_prompt, prompt) catch return;
+        if (prompt_len >= wide_prompt.len) return;
+        wide_prompt[prompt_len] = 0;
+        if (w32.MessageBoxW(null, @ptrCast(&wide_prompt), std.unicode.utf8ToUtf16LeStringLiteral("Open external link?"), w32.MB_OKCANCEL | w32.MB_ICONWARNING | w32.MB_DEFBUTTON2) != w32.IDOK) return;
+    }
     _ = w32.ShellExecuteW(
         null,
         std.unicode.utf8ToUtf16LeStringLiteral("open"),
@@ -2483,10 +2518,9 @@ fn discardPendingOpenUrls(self: *App) void {
 }
 
 fn discardOpenUrlRequest(self: *App, msg: w32.MSG) void {
-    if (msg.message == WM_APP_OPEN_URL and msg.wParam != 0 and msg.lParam > 0) {
-        const ptr: [*]u8 = @ptrFromInt(msg.wParam);
-        const len: usize = @intCast(msg.lParam);
-        self.core_app.alloc.free(ptr[0..len]);
+    if (msg.message == WM_APP_OPEN_URL and msg.wParam != 0) {
+        const request: *OpenUrlRequest = @ptrFromInt(msg.wParam);
+        request.deinit(self.core_app.alloc);
     }
 }
 
@@ -2521,14 +2555,11 @@ fn msgWndProc(
     }
 
     if (msg == WM_APP_OPEN_URL) {
-        // wparam = heap pointer to the UTF-8 URL, lparam = length.
-        // We own the buffer and must free it after use.
-        if (wparam != 0 and lparam > 0) {
-            const ptr: [*]u8 = @ptrFromInt(wparam);
-            const len: usize = @intCast(lparam);
-            const url = ptr[0..len];
-            defer app.core_app.alloc.free(url);
-            openUrlNow(url);
+        // Preserve the trust hint alongside the owned URL until dispatch.
+        if (wparam != 0) {
+            const request: *OpenUrlRequest = @ptrFromInt(wparam);
+            defer request.deinit(app.core_app.alloc);
+            openUrlNow(.{ .kind = request.kind, .url = request.url });
         }
         return 0;
     }
@@ -2650,11 +2681,11 @@ test "open URL is deferred and owns its input until dispatch" {
 
     var msg: w32.MSG = undefined;
     try testing.expect(w32.PeekMessageW(&msg, hwnd, WM_APP_OPEN_URL, WM_APP_OPEN_URL, w32.PM_REMOVE) != 0);
-    const ptr: [*]u8 = @ptrFromInt(msg.wParam);
-    const owned = ptr[0..@as(usize, @intCast(msg.lParam))];
+    const request: *OpenUrlRequest = @ptrFromInt(msg.wParam);
     _ = w32.SetWindowLongPtrW(hwnd, w32.GWLP_USERDATA, @bitCast(@intFromPtr(&app)));
     defer _ = msgWndProc(hwnd, msg.message, msg.wParam, msg.lParam);
-    try testing.expectEqualStrings(original, owned);
+    try testing.expectEqualStrings(original, request.url);
+    try testing.expectEqual(apprt.action.OpenUrl.Kind.osc8, request.kind);
 }
 
 test "open URL frees undelivered requests" {

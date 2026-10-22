@@ -3,14 +3,18 @@ pub const OpenGL = @This();
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const builtin = @import("builtin");
 const gl = @import("opengl");
+const egl = gl.egl;
 const shadertoy = @import("shadertoy.zig");
 const apprt = @import("../apprt.zig");
 const font = @import("../font/main.zig");
 const configpkg = @import("../config.zig");
 const rendererpkg = @import("../renderer.zig");
 const Renderer = rendererpkg.GenericRenderer(OpenGL);
+const Dmabuf = @import("Dmabuf.zig");
+const is_wgl = apprt.runtime == apprt.win32;
+const w32 = if (is_wgl) @import("../apprt/win32/win32.zig") else struct {};
+pub const Device = if (is_wgl) @import("opengl/WGLDevice.zig") else @import("opengl/Device.zig");
 
 pub const GraphicsAPI = OpenGL;
 pub const Target = @import("opengl/Target.zig");
@@ -27,28 +31,11 @@ pub const custom_shader_target: shadertoy.Target = .glsl;
 // The fragCoord for OpenGL shaders is +Y = up.
 pub const custom_shader_y_is_down = false;
 
-/// Because OpenGL's frame completion is always
-/// sync, we have no need for multi-buffering.
-pub const swap_chain_count = 1;
+/// Triple-buffering gives the GPU room to pipeline renders without
+/// having to wait on the apprt consuming previous frames.
+pub const swap_chain_count = 3;
 
 const log = std.log.scoped(.opengl);
-
-/// WGL declarations for Win32 OpenGL context management.
-/// Only defined when building for the win32 apprt.
-const wgl = if (apprt.runtime == apprt.win32) struct {
-    extern "opengl32" fn wglMakeCurrent(
-        hdc: ?*anyopaque,
-        hglrc: ?*anyopaque,
-    ) callconv(.c) i32;
-    extern "opengl32" fn wglGetCurrentDC() callconv(.c) ?*anyopaque;
-    extern "gdi32" fn SwapBuffers(hdc: ?*anyopaque) callconv(.c) i32;
-    extern "user32" fn WindowFromDC(hdc: ?*anyopaque) callconv(.c) ?std.os.windows.HWND;
-    const RECT = extern struct { left: i32, top: i32, right: i32, bottom: i32 };
-    extern "user32" fn GetClientRect(
-        hwnd: std.os.windows.HWND,
-        rect: *RECT,
-    ) callconv(.c) i32;
-} else struct {};
 
 /// We require at least OpenGL 4.3
 pub const MIN_VERSION_MAJOR = 4;
@@ -59,20 +46,67 @@ alloc: std.mem.Allocator,
 /// Alpha blending mode
 blending: configpkg.Config.AlphaBlending,
 
-/// The most recently presented target, in case we need to present it again.
-last_target: ?Target = null,
+/// The shared render device.
+device: *const Device,
 
-/// NOTE: This is an error{}!OpenGL instead of just OpenGL for parity with
-///       Metal, since it needs to be fallible so does this, even though it
-///       can't actually fail.
-pub fn init(alloc: Allocator, opts: rendererpkg.Options) error{}!OpenGL {
+egl_context: if (is_wgl) void else *gl.egl.Context,
+context_loaded: bool = false,
+
+pub fn init(
+    alloc: Allocator,
+    device: *const Device,
+    opts: rendererpkg.Options,
+) !OpenGL {
+    // WGL contexts belong to native surfaces. GPU resources are now created
+    // lazily on the render thread, so initialization must not bind the context
+    // on the GUI thread or require an EGL installation on Windows.
+    if (comptime is_wgl) return .{
+        .alloc = alloc,
+        .blending = opts.config.blending,
+        .device = device,
+        .egl_context = {},
+    };
+
+    const display = device.display;
+
+    // Bind to OpenGL API explicitly before we create the context,
+    // as otherwise it might fallback to OpenGL ES
+    try egl.bindApi(egl.c.EGL_OPENGL_API);
+
+    // Create our context. Contexts are surface-scoped because a
+    // context can only be current on one thread at a time.
+    const context = egl.Context.create(display, device.config, null, &.{
+        egl.c.EGL_CONTEXT_MAJOR_VERSION,       MIN_VERSION_MAJOR,
+        egl.c.EGL_CONTEXT_MINOR_VERSION,       MIN_VERSION_MINOR,
+        egl.c.EGL_CONTEXT_OPENGL_PROFILE_MASK, egl.c.EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT,
+    }) catch |err| {
+        log.warn("failed to create EGL context err={}", .{err});
+        return err;
+    };
+    errdefer context.destroy(display) catch {};
+
+    display.makeCurrent(null, null, context) catch |err| {
+        log.warn("failed to make EGL context current err={}", .{err});
+        return err;
+    };
+
+    // Release current so that the main thread
+    // doesn't hold onto the GL context forever.
+    defer display.releaseCurrent();
+
     return .{
         .alloc = alloc,
         .blending = opts.config.blending,
+        .device = device,
+        .egl_context = context,
     };
 }
 
 pub fn deinit(self: *OpenGL) void {
+    if (comptime !is_wgl) {
+        self.device.display.releaseCurrent();
+        self.egl_context.destroy(self.device.display) catch {};
+    }
     self.* = undefined;
 }
 
@@ -84,7 +118,7 @@ const gl_debug_proc_callconv =
                 gl.c.GLDEBUGPROC,
             ).optional.child,
         ).pointer.child,
-    ).@"fn".calling_convention;
+    ).@"fn".attrs.@"callconv";
 
 fn glDebugMessageCallback(
     src: gl.c.GLenum,
@@ -175,155 +209,73 @@ fn prepareContext(getProcAddress: anytype) !void {
     try gl.enable(gl.c.GL_FRAMEBUFFER_SRGB);
 }
 
-/// This is called early right after surface creation.
-pub fn surfaceInit(surface: *apprt.Surface) !void {
-    switch (apprt.runtime) {
-        else => @compileError("unsupported app runtime for OpenGL"),
-
-        // GTK uses global OpenGL context so we load from null.
-        apprt.gtk,
-        => try prepareContext(null),
-
-        apprt.embedded => {
-            // TODO(mitchellh): this does nothing today to allow libghostty
-            // to compile for OpenGL targets but libghostty is strictly
-            // broken for rendering on this platforms.
-        },
-
-        apprt.win32 => {
-            // For Win32/WGL, make the context current on the main thread.
-            // It stays current through Renderer.init() and finalizeSurfaceInit()
-            // so OpenGL resources (shaders, textures, buffers) can be created.
-            // It will be released in finalizeSurfaceInit (displayRealized)
-            // right before the renderer thread is spawned.
-            const hdc = surface.hdc orelse return error.InvalidSurface;
-            const hglrc = surface.hglrc orelse return error.InvalidSurface;
-
-            if (wgl.wglMakeCurrent(hdc, hglrc) == 0)
-                return error.WGLMakeCurrentFailed;
-
-            // Load GL functions. Passing null tells GLAD to use its
-            // built-in loader which on Windows uses opengl32.dll +
-            // wglGetProcAddress.
-            try prepareContext(null);
-
-            // NOTE: We intentionally do NOT release the context here.
-            // Renderer.init() needs a current GL context to create resources.
-            // The context is released in finalizeSurfaceInit/displayRealized.
-        },
+/// Callback called by renderer.Thread when it begins. Called on the render
+/// thread. The EGL context was created at `init` time on the main thread;
+/// here we (re)bind it to this thread and load the thread-local glad
+/// function pointers so all subsequent GL work on this thread is valid.
+pub fn threadEnter(self: *OpenGL, surface: *apprt.Surface) !void {
+    if (comptime is_wgl) {
+        const hdc = surface.hdc orelse return error.InvalidSurface;
+        const hglrc = surface.hglrc orelse return error.InvalidSurface;
+        if (w32.wglMakeCurrent(hdc, hglrc) == 0) return error.WGLMakeCurrentFailed;
+        errdefer _ = w32.wglMakeCurrent(null, null);
+        try prepareContext(null);
+        self.context_loaded = true;
+        return;
     }
-
-    // These are very noisy so this is commented, but easy to uncomment
-    // whenever we need to check the OpenGL extension list
-    // if (builtin.mode == .Debug) {
-    //     var ext_iter = try gl.ext.iterator();
-    //     while (try ext_iter.next()) |ext| {
-    //         log.debug("OpenGL extension available name={s}", .{ext});
-    //     }
-    // }
+    try self.device.display.makeCurrent(null, null, self.egl_context);
+    // Load our function pointers for this thread's threadlocal.
+    try prepareContext(&gl.egl.getProcAddress);
+    self.context_loaded = true;
 }
 
-/// This is called just prior to spinning up the renderer
-/// thread for final main thread setup requirements.
-pub fn finalizeSurfaceInit(self: *const OpenGL, surface: *apprt.Surface) !void {
+/// Callback called by renderer.Thread when it exits. Called on the render
+/// thread; unbinds the context from this thread so it can be destroyed on
+/// the main thread.
+pub fn threadExit(self: *OpenGL) void {
+    if (comptime is_wgl) {
+        _ = w32.wglMakeCurrent(null, null);
+    } else {
+        self.device.display.releaseCurrent();
+    }
+    if (self.context_loaded) {
+        gl.glad.unload();
+        self.context_loaded = false;
+    }
+}
+
+/// Get the current size of the runtime surface.
+pub fn surfaceSize(self: *const OpenGL) !struct { width: u32, height: u32 } {
     _ = self;
-    _ = surface;
-
-    // On Win32, release the WGL context from the main thread so the
-    // renderer thread can make it current in threadEnter. The context
-    // was kept current since surfaceInit to allow Renderer.init() to
-    // create GL resources.
-    if (comptime apprt.runtime == apprt.win32) {
-        _ = wgl.wglMakeCurrent(null, null);
+    if (comptime is_wgl) {
+        // GL_VIEWPORT can still describe the previous frame while WM_SIZE
+        // is in flight. Query the window associated with this thread's DC.
+        const hdc = w32.wglGetCurrentDC() orelse return error.NoCurrentContext;
+        const hwnd = w32.WindowFromDC(hdc) orelse return error.NoWindow;
+        var rect: w32.RECT = undefined;
+        if (w32.GetClientRect(hwnd, &rect) == 0) return error.NoWindow;
+        return .{
+            .width = @intCast(@max(0, rect.right - rect.left)),
+            .height = @intCast(@max(0, rect.bottom - rect.top)),
+        };
     }
+    var viewport: [4]gl.c.GLint = undefined;
+    gl.glad.context.GetIntegerv.?(gl.c.GL_VIEWPORT, &viewport);
+    return .{
+        .width = @intCast(viewport[2]),
+        .height = @intCast(viewport[3]),
+    };
 }
 
-/// Callback called by renderer.Thread when it begins.
-pub fn threadEnter(self: *const OpenGL, surface: *apprt.Surface) !void {
+/// Set the GL viewport to cover the given size in device pixels.
+///
+/// This used to be automatically called by the GtkGLArea upon resizing,
+/// but now we need to do this manually.
+pub fn setViewport(self: *const OpenGL, width: u32, height: u32) void {
     _ = self;
-
-    switch (apprt.runtime) {
-        else => @compileError("unsupported app runtime for OpenGL"),
-
-        apprt.gtk => {
-            // GTK doesn't support threaded OpenGL operations as far as I can
-            // tell, so we use the renderer thread to setup all the state
-            // but then do the actual draws and texture syncs and all that
-            // on the main thread. As such, we don't do anything here.
-        },
-
-        apprt.embedded => {
-            // TODO(mitchellh): this does nothing today to allow libghostty
-            // to compile for OpenGL targets but libghostty is strictly
-            // broken for rendering on this platforms.
-        },
-
-        apprt.win32 => {
-            // Make the WGL context current on the renderer thread.
-            const hdc = surface.hdc orelse return error.InvalidSurface;
-            const hglrc = surface.hglrc orelse return error.InvalidSurface;
-
-            if (wgl.wglMakeCurrent(hdc, hglrc) == 0)
-                return error.WGLMakeCurrentFailed;
-
-            // Reload GL functions on this thread since OpenGL is
-            // thread-local state.
-            try prepareContext(null);
-        },
-    }
-}
-
-/// Callback called by renderer.Thread when it exits.
-pub fn threadExit(self: *const OpenGL) void {
-    _ = self;
-
-    switch (apprt.runtime) {
-        else => @compileError("unsupported app runtime for OpenGL"),
-
-        apprt.gtk => {
-            // We don't need to do any unloading for GTK because we may
-            // be sharing the global bindings with other windows.
-        },
-
-        apprt.embedded => {
-            // TODO: see threadEnter
-        },
-
-        apprt.win32 => {
-            // Release the WGL context from the renderer thread.
-            _ = wgl.wglMakeCurrent(null, null);
-        },
-    }
-}
-
-pub fn displayRealized(self: *const OpenGL) void {
-    _ = self;
-
-    switch (apprt.runtime) {
-        apprt.gtk => prepareContext(null) catch |err| {
-            log.warn(
-                "Error preparing GL context in displayRealized, err={}",
-                .{err},
-            );
-        },
-
-        apprt.win32 => {
-            // Nothing to do. On Win32 this is only called during
-            // context-loss recovery on the renderer thread, after
-            // recreateGLContext + threadEnter already made the new
-            // context current. It must stay current for the GL calls
-            // the generic renderer makes right after this.
-        },
-
-        else => @compileError("only GTK should be calling displayRealized"),
-    }
-}
-
-/// Called during context-loss recovery. The last presented target
-/// references a framebuffer from the lost context, so it must not
-/// be presented again.
-pub fn contextLost(self: *OpenGL) void {
-    self.last_target = null;
+    gl.viewport(0, 0, @intCast(width), @intCast(height)) catch |err| {
+        log.warn("failed to set OpenGL viewport err={}", .{err});
+    };
 }
 
 /// Actions taken before doing anything in `drawFrame`.
@@ -335,14 +287,9 @@ pub fn drawFrameStart(self: *OpenGL) void {
 
 /// Actions taken after `drawFrame` is done.
 ///
-/// On Win32 with double-buffered WGL, swap the front/back buffers
-/// so the rendered frame appears on screen.
+/// Right now there's nothing we need to do for OpenGL.
 pub fn drawFrameEnd(self: *OpenGL) void {
     _ = self;
-    if (comptime apprt.runtime == apprt.win32) {
-        const hdc = wgl.wglGetCurrentDC();
-        if (hdc != null) _ = wgl.SwapBuffers(hdc);
-    }
 }
 
 pub fn initShaders(
@@ -357,99 +304,88 @@ pub fn initShaders(
     );
 }
 
-/// Get the current size of the runtime surface.
-pub fn surfaceSize(self: *const OpenGL) !struct { width: u32, height: u32 } {
-    _ = self;
-
-    // On Win32, query the actual window client rect instead of
-    // GL_VIEWPORT. GL_VIEWPORT is only updated when we call
-    // glViewport explicitly (no framework does it for us), creating
-    // a chicken-and-egg problem during resize. The Win32 Surface
-    // caches the client dimensions from WM_SIZE.
-    if (comptime apprt.runtime == apprt.win32) {
-        // Use the thread-local WGL DC to find our HWND, then query
-        // the actual window client rect for the current size.
-        const hdc = wgl.wglGetCurrentDC() orelse return error.NoCurrentContext;
-        const hwnd = wgl.WindowFromDC(hdc) orelse return error.NoWindow;
-        var rect: wgl.RECT = undefined;
-        if (wgl.GetClientRect(hwnd, &rect) != 0) {
-            const w: u32 = @intCast(rect.right - rect.left);
-            const h: u32 = @intCast(rect.bottom - rect.top);
-            if (w > 0 and h > 0) {
-                // Update glViewport to match
-                gl.glad.context.Viewport.?(0, 0, @intCast(w), @intCast(h));
-                return .{ .width = w, .height = h };
-            }
-        }
-    }
-
-    var viewport: [4]gl.c.GLint = undefined;
-    gl.glad.context.GetIntegerv.?(gl.c.GL_VIEWPORT, &viewport);
-    return .{
-        .width = @intCast(viewport[2]),
-        .height = @intCast(viewport[3]),
-    };
-}
-
 /// Initialize a new render target which can be presented by this API.
 pub fn initTarget(self: *const OpenGL, width: usize, height: usize) !Target {
+    _ = self;
     return Target.init(.{
-        .internal_format = if (self.blending.isLinear()) .srgba else .rgba,
         .width = width,
         .height = height,
     });
 }
 
-/// Present the provided target.
-pub fn present(self: *OpenGL, target: Target) !void {
-    // In order to present a target we blit it to the default framebuffer.
+/// Export a rendered target. Caller takes ownership
+/// of the frame and is responsible for freeing it.
+///
+/// This runs on the render thread.
+pub fn present(
+    self: *OpenGL,
+    target: Target,
+    presentation_health: rendererpkg.Health,
+) !ExportedFrame {
+    if (comptime is_wgl) {
+        const hdc = w32.wglGetCurrentDC() orelse return error.NoCurrentContext;
+        const binding = try target.framebuffer.bind(.read);
+        defer binding.unbind();
+        // RenderPass restores the draw framebuffer to the window (zero).
+        // Present directly; Windows does not consume exported EGL frames.
+        try gl.blitFramebuffer(
+            0,
+            0,
+            @intCast(target.width),
+            @intCast(target.height),
+            0,
+            0,
+            @intCast(target.width),
+            @intCast(target.height),
+            .{ .color_buffer_bit = true },
+            .nearest,
+        );
+        if (w32.SwapBuffers(hdc) == 0) return error.SwapBuffersFailed;
+        return;
+    }
+    // We only export DMABUFs when the apprt can present them.
+    // Otherwise, use CPU buffers.
+    if (presentation_health == .healthy) {
+        if (target.exportDmabuf(self.device.display, self.egl_context)) |dmabuf| {
+            return .{ .dmabuf = dmabuf };
+        } else |_| {
+            log.warn("failed to export DMABUF, falling back to CPU presentation", .{});
+        }
+    }
 
-    // We disable GL_FRAMEBUFFER_SRGB while doing this blit, otherwise the
-    // values may be linearized as they're copied, but even though the draw
-    // framebuffer has a linear internal format, the values in it should be
-    // sRGB, not linear!
-    try gl.disable(gl.c.GL_FRAMEBUFFER_SRGB);
-    defer gl.enable(gl.c.GL_FRAMEBUFFER_SRGB) catch |err| {
-        log.err("Error re-enabling GL_FRAMEBUFFER_SRGB, err={}", .{err});
+    return .{ .memory = .{
+        .width = @intCast(target.width),
+        .height = @intCast(target.height),
+        .pixels = try target.readPixelsAlloc(self.alloc),
+        .alloc = self.alloc,
+    } };
+}
+
+/// A finished frame exported for presentation by the apprt.
+pub const ExportedFrame = if (is_wgl) void else union(enum) {
+    dmabuf: Dmabuf,
+    memory: Memory,
+
+    /// RGBA8 pixel data with premultiplied alpha, tightly packed
+    /// (`width * 4` bytes per row), in CPU memory.
+    pub const Memory = struct {
+        width: u32,
+        height: u32,
+        pixels: []u8,
+        alloc: Allocator,
+
+        pub fn deinit(self: Memory) void {
+            self.alloc.free(self.pixels);
+        }
     };
 
-    // Update the viewport to match the target dimensions. On Win32
-    // there's no framework (like GTK's GLArea) that automatically
-    // updates glViewport when the window resizes.
-    gl.glad.context.Viewport.?(0, 0, @intCast(target.width), @intCast(target.height));
-
-    // Bind the target for reading.
-    const fbobind = try target.framebuffer.bind(.read);
-    defer fbobind.unbind();
-
-    // Blit
-    gl.glad.context.BlitFramebuffer.?(
-        0,
-        0,
-        @intCast(target.width),
-        @intCast(target.height),
-        0,
-        0,
-        @intCast(target.width),
-        @intCast(target.height),
-        gl.c.GL_COLOR_BUFFER_BIT,
-        gl.c.GL_NEAREST,
-    );
-
-    // Keep track of this target in case we need to repeat it.
-    self.last_target = target;
-}
-
-/// Present the last presented target again.
-pub fn presentLastTarget(self: *OpenGL) !void {
-    if (self.last_target) |target| try self.present(target);
-}
-
-/// Called when the renderer released its GPU resources; the last
-/// presented target is deinited with them so we must drop our copy.
-pub fn gpuResourcesReleased(self: *OpenGL) void {
-    self.last_target = null;
-}
+    pub fn deinit(self: ExportedFrame) void {
+        switch (self) {
+            .dmabuf => |v| v.deinit(),
+            .memory => |v| v.deinit(),
+        }
+    }
+};
 
 /// Returns the options to use when constructing buffers.
 pub inline fn bufferOptions(self: OpenGL) bufferpkg.Options {
@@ -473,7 +409,7 @@ pub inline fn textureOptions(self: OpenGL) Texture.Options {
     return .{
         .format = .rgba,
         .internal_format = .srgba,
-        .target = .@"2D",
+        .target = .@"2d",
         .min_filter = .linear,
         .mag_filter = .linear,
         .wrap_s = .clamp_to_edge,
@@ -520,7 +456,7 @@ pub inline fn imageTextureOptions(
     return .{
         .format = format.toPixelFormat(),
         .internal_format = if (srgb) .srgba else .rgba,
-        .target = .@"2D",
+        .target = .@"2d",
         // TODO: Generate mipmaps for image textures and use
         //       linear_mipmap_linear filtering so that they
         //       look good even when scaled way down.
@@ -551,7 +487,7 @@ pub fn initAtlasTexture(
         .{
             .format = format,
             .internal_format = internal_format,
-            .target = .Rectangle,
+            .target = .rectangle,
             .min_filter = .nearest,
             .mag_filter = .nearest,
             .wrap_s = .clamp_to_edge,

@@ -19,7 +19,7 @@ A file for [guiding coding agents](https://agents.md/).
 ## libghostty-vt
 
 - Build: `zig build -Demit-lib-vt`
-- Build WASM: `zig build -Demit-lib-vt -Dtarget=wasm32-freestanding -Doptimize=ReleaseSmall`
+- Build WASM: `zig build -Demit-lib-vt -Dtarget=wasm32-freestanding -Doptimize=small`
 - Test: `zig build test-lib-vt -Dtest-filter=<filter>`
   - Prefer this when the change is in a libghostty-vt file
 - All C enums in `include/ghostty/vt/` must have a `_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE`
@@ -42,13 +42,18 @@ A file for [guiding coding agents](https://agents.md/).
   `zig build -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu`.
   The explicit GNU ABI avoids requiring Visual Studio and Windows SDK headers
   and is the target exercised by Windows CI.
-- Build a release with the same options plus `-Doptimize=ReleaseFast`.
+- Build a release with the same options plus `-Doptimize=fast`.
   Add `-Dwindows-console=true` when release-mode stderr/stdout is needed.
 - Run the Windows compile and Zig tests with
   `zig build test -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu`.
+- From WSL, compile without running with `zig build test-build` and the same
+  target options; add `-Demit-test-exe=true` to install the test executable.
 - Run the Win32 integration suite from WSL with
   `bash test/win32/ghostty_test.sh all`. Add a focused automated test for
   each new Windows feature instead of relying only on manual verification.
+- Global-input tests require a dedicated, isolated desktop. Never set
+  `GHOSTTY_TEST_ISOLATED_DESKTOP=1` on a shared working desktop; use the
+  no-input `program_window_resize` case there instead.
 - Launch automated tests from a local Windows path such as `%TEMP%`, not a
   WSL UNC path. The test harness handles this for the main executable.
 - The Windows config is `%LOCALAPPDATA%\ghostty\config.ghostty`; the legacy

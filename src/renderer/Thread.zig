@@ -13,7 +13,6 @@ const apprt = @import("../apprt.zig");
 const configpkg = @import("../config.zig");
 const terminalpkg = @import("../terminal/main.zig");
 const BlockingQueue = @import("../datastruct/main.zig").BlockingQueue;
-const App = @import("../App.zig");
 
 const Allocator = std.mem.Allocator;
 const log = std.log.scoped(.renderer_thread);
@@ -87,9 +86,6 @@ state: *rendererpkg.State,
 /// this is a blocking queue so if it is full you will get errors (or block).
 mailbox: *Mailbox,
 
-/// Mailbox to send messages to the app thread
-app_mailbox: App.Mailbox,
-
 /// Configuration we need derived from the main config.
 config: DerivedConfig,
 
@@ -136,7 +132,6 @@ pub fn init(
     surface: *apprt.Surface,
     renderer_impl: *rendererpkg.Renderer,
     state: *rendererpkg.State,
-    app_mailbox: App.Mailbox,
 ) !Thread {
     // Create our event loop.
     var loop = try xev.Loop.init(.{});
@@ -179,7 +174,6 @@ pub fn init(
         .renderer = renderer_impl,
         .state = state,
         .mailbox = mailbox,
-        .app_mailbox = app_mailbox,
     };
 
     // Only enable compression if we have it enabled... save some
@@ -222,7 +216,7 @@ fn threadMain_(self: *Thread) !void {
     // Right now, on Darwin, `std.Thread.setName` can only name the current
     // thread, and we have no way to get the current thread from within it,
     // so instead we use this code to name the thread instead.
-    if (builtin.os.tag.isDarwin()) {
+    if (builtin.target.os.tag.isDarwin()) {
         internal_os.macos.pthread_setname_np(&"renderer".*);
     }
 
@@ -311,11 +305,11 @@ fn drainMailbox(self: *Thread) !void {
     //
     // This is effectively an @autoreleasepool{} block, which we need in
     // order to ensure that autoreleased objects are properly released.
-    const pool = if (builtin.os.tag.isDarwin())
+    const pool = if (builtin.target.os.tag.isDarwin())
         @import("objc").AutoreleasePool.init()
     else
         void;
-    defer if (builtin.os.tag.isDarwin()) pool.deinit();
+    defer if (builtin.target.os.tag.isDarwin()) pool.deinit();
 
     while (self.mailbox.pop(global.io())) |message| {
         log.debug("mailbox message={}", .{message});
@@ -418,6 +412,8 @@ fn drainMailbox(self: *Thread) !void {
                 grid.set.deref(grid.old_key);
             },
 
+            .presentation_health => |v| self.renderer.setPresentationHealth(v),
+
             .resize => |v| self.renderer.setScreenSize(v),
 
             .change_config => |config| {
@@ -484,12 +480,7 @@ fn drawFrame(self: *Thread, now: bool) void {
     // when we're forced to via `now`.
     if (!now and self.renderer.hasVsync()) return;
 
-    if (apprt.must_draw_from_app_thread) {
-        _ = self.app_mailbox.push(
-            .{ .redraw_surface = self.surface },
-            .{ .instant = {} },
-        );
-    } else {
+    {
         var errored = false;
         self.renderer.drawFrame(false) catch |err| {
             errored = true;
@@ -538,7 +529,7 @@ fn recoverContext(self: *Thread) void {
 
     // Tear down all GPU state. The old (lost) context is still
     // current, so the GL deletes are no-ops or harmless errors.
-    self.renderer.displayUnrealized();
+    self.renderer.threadExit();
 
     // Recreate the GL context and make it current on this thread.
     self.surface.recreateGLContext() catch |err| {
@@ -546,24 +537,14 @@ fn recoverContext(self: *Thread) void {
         return;
     };
 
-    // Reload GL function pointers for the new context. On failure the
-    // GL function pointers may be poisoned (GLAD unloads on error), so
-    // release the context via threadExit: subsequent drawFrames then
-    // fail cleanly at surfaceSize (no current context) before making
-    // any GL calls.
+    // Reload GL function pointers for the new context. On failure,
+    // threadEnter releases the context and future draws fail before GL calls.
     self.renderer.threadEnter(self.surface) catch |err| {
         log.warn("error in threadEnter during context recovery err={}", .{err});
-        self.renderer.threadExit();
         return;
     };
 
-    // Reset renderer state that still references the lost context.
-    // This MUST run before displayRealized: it issues glDeletes on
-    // texture names captured in the lost context, and right now the
-    // fresh context has no live names so those deletes are silently
-    // ignored. After displayRealized the fresh context reuses the same
-    // low names for the new atlas/target textures and the deletes
-    // would destroy them.
+    // Reload CPU-side images before resources are rebuilt lazily on draw.
     self.renderer.rebuildAfterContextLoss();
 
     // Rebuild the swap chain and shaders.
@@ -660,6 +641,17 @@ fn renderCallback(
         log.warn("render callback fired without data set", .{});
         return .disarm;
     };
+
+    // If the display is now unrealized, release GPU resources now
+    // we're on the render thread, and do not try to update and draw
+    // this frame.
+    if (!t.renderer.display_realized) {
+        t.renderer.draw_mutex.lockUncancelable(global.io());
+        defer t.renderer.draw_mutex.unlock(global.io());
+
+        t.renderer.releaseGpuResources();
+        return .disarm;
+    }
 
     // If we're not visible there's no point spending CPU rebuilding cells —
     // we'll catch up when the .visible mailbox message flips us back on.

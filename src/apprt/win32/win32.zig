@@ -589,6 +589,8 @@ pub extern "user32" fn IsZoomed(
     hWnd: HWND,
 ) callconv(.winapi) i32;
 
+pub extern "user32" fn IsIconic(hwnd: HWND) callconv(.winapi) i32;
+
 pub extern "user32" fn SetCursor(
     // NULL is documented as valid — it hides the cursor. Make the
     // parameter optional so callers can pass null without a cast.
@@ -1201,6 +1203,9 @@ pub extern "opengl32" fn wglMakeCurrent(
     hdc: ?HDC,
     hglrc: ?HGLRC,
 ) callconv(.winapi) i32;
+
+pub extern "opengl32" fn wglGetCurrentDC() callconv(.winapi) ?HDC;
+pub extern "user32" fn WindowFromDC(hdc: HDC) callconv(.winapi) ?HWND;
 
 pub extern "opengl32" fn wglDeleteContext(
     hglrc: HGLRC,

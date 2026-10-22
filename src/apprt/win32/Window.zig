@@ -1008,7 +1008,7 @@ pub fn selectTab(self: *Window, target: apprt.action.GotoTab) bool {
         _ => blk: {
             // GotoTab carries a c_int; clamp non-negative before casting
             // so a negative sentinel doesn't panic the @intCast.
-            const raw = @intFromEnum(target);
+            const raw = @backingInt(target);
             if (raw < 0) return false;
             const n: usize = @intCast(raw);
             break :blk if (n < self.tab_count) n else return false;
@@ -1456,6 +1456,96 @@ fn paintTabBar(self: *Window) void {
     _ = w32.BitBlt(hdc_screen, 0, 0, client_w, bar_h, mem_dc, 0, 0, w32.SRCCOPY);
 }
 
+/// Honor a program's CSI 8 t resize only when it owns the whole window.
+/// Changing the outer dimensions by the surface-size delta accounts for
+/// non-client borders without assuming a particular decoration or DPI.
+pub fn resizeSurface(self: *Window, surface: *Surface, size: apprt.action.ResizeWindow) bool {
+    const hwnd = self.hwnd orelse return false;
+    if (self.closing or self.is_quick_terminal or self.is_fullscreen or
+        w32.IsZoomed(hwnd) != 0 or w32.IsIconic(hwnd) != 0) return false;
+    if (self.tab_count != 1 or self.tab_trees[0].isSplit() or
+        self.tab_active_surface[0] != surface) return false;
+    const surface_hwnd = surface.hwnd orelse return false;
+    var outer: w32.RECT = undefined;
+    var client: w32.RECT = undefined;
+    if (w32.GetWindowRect(hwnd, &outer) == 0 or
+        w32.GetClientRect(surface_hwnd, &client) == 0) return false;
+
+    // The surface's drawable width excludes a reserved (non-overlay)
+    // scrollbar strip; the child HWND's client rectangle does not.
+    const current = surface.getSize() catch return false;
+    var width = resizedDimension(size.width, surface.scale, @intCast(current.width), outer.right - outer.left);
+    var height = resizedDimension(size.height, surface.scale, @intCast(current.height), outer.bottom - outer.top);
+    var monitor: w32.MONITORINFO = undefined;
+    monitor.cbSize = @sizeOf(w32.MONITORINFO);
+    if (w32.GetMonitorInfoW(w32.MonitorFromWindow(hwnd, w32.MONITOR_DEFAULTTONEAREST), &monitor) != 0) {
+        if (size.width > 0) width = @min(width, monitor.rcWork.right - monitor.rcWork.left);
+        if (size.height > 0) height = @min(height, monitor.rcWork.bottom - monitor.rcWork.top);
+    }
+    return w32.SetWindowPos(hwnd, null, 0, 0, width, height, w32.SWP_NOZORDER | w32.SWP_NOMOVE | w32.SWP_NOACTIVATE) != 0;
+}
+
+fn resizedDimension(requested: u32, scale: f32, current: i32, outer: i32) i32 {
+    if (requested == 0) return outer;
+    // Bound untrusted terminal requests before converting back to Win32's
+    // signed dimensions. Larger sizes are not useful desktop window sizes.
+    const px = @min(@as(f64, @floatFromInt(requested)) * scale, 32_767);
+    return @max(1, outer - current + @as(i32, @intFromFloat(@ceil(px))));
+}
+
+test "program resize preserves zero dimensions and scales points" {
+    const testing = std.testing;
+    try testing.expectEqual(@as(i32, 816), resizedDimension(0, 1.5, 800, 816));
+    try testing.expectEqual(@as(i32, 916), resizedDimension(600, 1.5, 800, 816));
+    try testing.expectEqual(@as(i32, 516), resizedDimension(500, 1, 800, 816));
+    try testing.expectEqual(@as(i32, 32_783), resizedDimension(std.math.maxInt(u32), 2, 800, 816));
+}
+
+test "program resize native window guards and zero dimensions" {
+    const testing = std.testing;
+    const class = std.unicode.utf8ToUtf16LeStringLiteral("STATIC");
+    const title = std.unicode.utf8ToUtf16LeStringLiteral("");
+    // Hidden system-class windows need neither a renderer nor an application.
+    const hwnd = w32.CreateWindowExW(0, class, title, w32.WS_OVERLAPPEDWINDOW, 0, 0, 400, 300, null, null, null, null) orelse return error.Win32Error;
+    defer _ = w32.DestroyWindow(hwnd);
+    const child = w32.CreateWindowExW(0, class, title, w32.WS_CHILD, 0, 0, 200, 100, hwnd, null, null, null) orelse return error.Win32Error;
+    defer _ = w32.DestroyWindow(child);
+    var surface: Surface = undefined;
+    surface.hwnd = child;
+    surface.scale = 1;
+    // Simulate a 20-pixel scrollbar reservation within the 200-pixel child.
+    surface.width = 180;
+    surface.height = 100;
+    var window: Window = .{ .app = undefined, .hwnd = hwnd, .tab_count = 1 };
+    window.tab_active_surface[0] = &surface;
+    window.tab_trees[0] = .{ .arena = undefined, .nodes = &.{.{ .leaf = &surface }}, .zoomed = null };
+
+    var before: w32.RECT = undefined;
+    var after: w32.RECT = undefined;
+    try testing.expect(w32.GetWindowRect(hwnd, &before) != 0);
+    try testing.expect(window.resizeSurface(&surface, .{ .width = 220, .height = 0 }));
+    try testing.expect(w32.GetWindowRect(hwnd, &after) != 0);
+    try testing.expectEqual(before.right - before.left + 40, after.right - after.left);
+    try testing.expectEqual(before.bottom - before.top, after.bottom - after.top);
+    before = after;
+    try testing.expect(window.resizeSurface(&surface, .{ .width = 0, .height = 120 }));
+    try testing.expect(w32.GetWindowRect(hwnd, &after) != 0);
+    try testing.expectEqual(before.right - before.left, after.right - after.left);
+    try testing.expectEqual(before.bottom - before.top + 20, after.bottom - after.top);
+
+    window.is_fullscreen = true;
+    try testing.expect(!window.resizeSurface(&surface, .{ .width = 100, .height = 100 }));
+    window.is_fullscreen = false;
+    window.is_quick_terminal = true;
+    try testing.expect(!window.resizeSurface(&surface, .{ .width = 100, .height = 100 }));
+    window.is_quick_terminal = false;
+    window.tab_count = 2;
+    try testing.expect(!window.resizeSurface(&surface, .{ .width = 100, .height = 100 }));
+    window.tab_count = 1;
+    window.tab_trees[0].nodes = &.{.{ .split = undefined }};
+    try testing.expect(!window.resizeSurface(&surface, .{ .width = 100, .height = 100 }));
+}
+
 /// Toggle fullscreen mode on the top-level window.
 /// Saves/restores window style and placement.
 pub fn toggleFullscreen(self: *Window) void {
@@ -1528,7 +1618,7 @@ fn showResizeOverlay(self: *Window) void {
     const grid = surface.core_surface.size.grid();
 
     var buf8: [32]u8 = undefined;
-    const text8 = std.fmt.bufPrint(&buf8, "{d} \u{00D7} {d}", .{
+    const text8 = std.mem.print(&buf8, "{d} \u{00D7} {d}", .{
         grid.columns,
         grid.rows,
     }) catch return;

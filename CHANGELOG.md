@@ -3,6 +3,25 @@
 All notable changes to the Ghostty Windows fork. Each release line includes
 the underlying upstream commit when known.
 
+## Unreleased
+
+- Sync 733 upstream commits through `f54340ad7` (2026-10-21), including terminal,
+  Kitty graphics/render-state, snapshot, paste-protection, and libghostty-vt updates.
+- Require Zig 0.17.0 for Windows builds, CI, and packaging (`-Doptimize=fast`).
+- Retain Windows SEH unwind metadata in stripped releases so MinGW's runtime
+  remains buildable; verify both debug and release builds in CI.
+- Adapt Windows WGL to upstream's shared-device and render-thread resource
+  lifecycle while retaining bounded shutdown and GPU-context recovery.
+- Avoid holding the terminal lock while synchronously resizing ConPTY, which
+  otherwise prevents its output reader from draining a resize repaint.
+- Support opt-in CSI 8 t window resizing with DPI scaling, zero-dimension
+  preservation, monitor limits, and fullscreen/tab/split guards.
+- Validate untrusted terminal links before dispatch: allow HTTP(S)/mailto,
+  confirm custom schemes, and block untrusted paths/file URLs. Preserve deferred
+  opening and queued-request cleanup from the URL deadlock fix.
+- Disable global-input integration tests on shared desktops by default; the
+  program-resize test uses an isolated child/file handshake without keyboard input.
+
 ## win-v1.3.0 — 2026-09-01
 
 Upstream sync (1,248 commits from `ghostty-org/ghostty` main, through

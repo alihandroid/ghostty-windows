@@ -2,8 +2,8 @@
 # Build and package Ghostty for Windows as a portable ZIP.
 #
 # Usage:
-#   ./dist/windows/package.sh              # ReleaseFast, x86_64
-#   ./dist/windows/package.sh Debug        # Debug build (Console subsystem)
+#   ./dist/windows/package.sh              # fast, x86_64
+#   ./dist/windows/package.sh debug        # Debug build (Console subsystem)
 #
 # Output: dist/windows/ghostty-windows-x64-<version>.zip
 
@@ -11,7 +11,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
-OPTIMIZE="${1:-ReleaseFast}"
+OPTIMIZE="${1:-fast}"
 
 cd "$REPO_DIR"
 
