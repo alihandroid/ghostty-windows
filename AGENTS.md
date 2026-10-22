@@ -51,6 +51,9 @@ A file for [guiding coding agents](https://agents.md/).
 - Run the Win32 integration suite from WSL with
   `bash test/win32/ghostty_test.sh all`. Add a focused automated test for
   each new Windows feature instead of relying only on manual verification.
+- Global-input tests require a dedicated, isolated desktop. Never set
+  `GHOSTTY_TEST_ISOLATED_DESKTOP=1` on a shared working desktop; use the
+  no-input `program_window_resize` case there instead.
 - Launch automated tests from a local Windows path such as `%TEMP%`, not a
   WSL UNC path. The test harness handles this for the main executable.
 - The Windows config is `%LOCALAPPDATA%\ghostty\config.ghostty`; the legacy

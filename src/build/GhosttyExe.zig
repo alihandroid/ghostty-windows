@@ -19,7 +19,14 @@ pub fn init(b: *std.Build, cfg: *const Config, deps: *const SharedDeps) !Ghostty
             .optimize = cfg.optimize,
             .strip = cfg.strip,
             .omit_frame_pointer = cfg.omitFramePointer(),
-            .unwind_tables = if (cfg.strip) .none else .sync,
+            // MinGW's CRT and Windows SEH require unwind metadata even
+            // when debug symbols are stripped from a release executable.
+            .unwind_tables = if (cfg.target.result.os.tag == .windows)
+                .async
+            else if (cfg.strip)
+                .none
+            else
+                .sync,
         }),
         // Crashes on x86_64 self-hosted on 0.15.1
         .use_llvm = true,

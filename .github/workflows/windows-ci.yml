@@ -78,6 +78,9 @@ jobs:
       - name: Build
         run: zig build -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu
 
+      - name: Build stripped release
+        run: zig build -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu -Doptimize=fast
+
   fmt:
     name: zig fmt
     runs-on: ubuntu-latest
