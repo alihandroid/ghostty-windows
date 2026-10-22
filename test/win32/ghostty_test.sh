@@ -58,10 +58,10 @@ get_val() {
 }
 
 # Launch ghostty and set GHOSTTY_HWND from the output.
-# Usage: launch_and_set_hwnd [wait_ms]
+# Usage: launch_and_set_hwnd [wait_ms] [args]
 # Sets: GHOSTTY_HWND, LAUNCH_OUTPUT (use get_val on LAUNCH_OUTPUT)
 launch_and_set_hwnd() {
-    LAUNCH_OUTPUT="$(powershell.exe -ExecutionPolicy Bypass -File "$HARNESS_PS1" -Action launch -ExePath "$GHOSTTY_EXE" -WaitMs "${1:-5000}" 2>&1 | tr -d '\r')"
+    LAUNCH_OUTPUT="$(powershell.exe -ExecutionPolicy Bypass -File "$HARNESS_PS1" -Action launch -ExePath "$GHOSTTY_EXE" -WaitMs "${1:-5000}" -Args "${2:-}" 2>&1 | tr -d '\r')"
     local hwnd
     hwnd="$(get_val "$LAUNCH_OUTPUT" HWND)"
     if [ -n "$hwnd" ] && [ "$hwnd" != "0" ]; then
@@ -569,7 +569,7 @@ test_url_detection() {
     echo "▶ test_url_detection"
     local output
     GHOSTTY_HWND=0
-    launch_and_set_hwnd 5000
+    launch_and_set_hwnd 5000 "--config-default-files=false --command=cmd.exe"
     output="$LAUNCH_OUTPUT"
     local pid window_found
     pid="$(get_val "$output" PID)"
@@ -582,9 +582,10 @@ test_url_detection() {
         return
     fi
 
-    # Echo a URL in the terminal
+    # Fill the viewport so the click does not depend on prompt height,
+    # shell startup text, or the row containing a single echoed URL.
     sleep 1
-    ps -Action sendtext -ProcessId "$pid" -Text "echo https://example.com"
+    ps -Action sendtext -ProcessId "$pid" -Text "for /l %i in (1,1,100) do @echo https://example.com"
     ps -Action sendkeys -ProcessId "$pid" -Keys "{ENTER}"
     sleep 1
 
@@ -592,9 +593,8 @@ test_url_detection() {
     screenshot "url_detection" "$pid"
     echo "  ✓ URL echoed in terminal"
 
-    # Ctrl+click the URL to test open_url action.
-    # The URL "https://example.com" is on the output line.
-    # We use PowerShell to move the mouse to the URL position and Ctrl+click.
+    # Ctrl+click a URL, using the known HWND from launch (EnumWindows
+    # across WSL sessions is unreliable).
     local click_result
     click_result="$(powershell.exe -ExecutionPolicy Bypass -Command '
 Add-Type @"
@@ -602,17 +602,10 @@ using System;
 using System.Runtime.InteropServices;
 public class ClickTest {
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
-    [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
     [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
     [DllImport("user32.dll")] public static extern void mouse_event(uint dwFlags, int dx, int dy, uint data, IntPtr extra);
     [DllImport("user32.dll")] public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, IntPtr extra);
-    [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
-    [DllImport("user32.dll")] public static extern bool GetClientRect(IntPtr h, out RECT r);
     [DllImport("user32.dll")] public static extern bool ClientToScreen(IntPtr h, ref POINT p);
-    public delegate bool EP(IntPtr h, IntPtr l);
-    [DllImport("user32.dll")] public static extern bool EnumWindows(EP p, IntPtr l);
-    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
-    [StructLayout(LayoutKind.Sequential)] public struct RECT { public int L,T,R,B; }
     [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X,Y; }
     public const uint MOUSEEVENTF_LEFTDOWN = 0x0002;
     public const uint MOUSEEVENTF_LEFTUP = 0x0004;
@@ -620,19 +613,10 @@ public class ClickTest {
     public const uint KEYEVENTF_KEYUP = 0x0002;
 }
 "@
-$found=$null
-$cb=[ClickTest+EP]{param($h,$l); $p=[uint32]0
-  [ClickTest]::GetWindowThreadProcessId($h,[ref]$p)|Out-Null
-  if($p -eq '"$pid"' -and [ClickTest]::IsWindowVisible($h)){
-    $cr=New-Object ClickTest+RECT; [ClickTest]::GetClientRect($h,[ref]$cr)|Out-Null
-    if($cr.R -gt 0){$script:found=$h}}; $true}
-[ClickTest]::EnumWindows($cb,[IntPtr]::Zero)|Out-Null
-if(-not $found){Write-Output "NO_WINDOW"; exit}
+$found=[IntPtr]'"$GHOSTTY_HWND"'
 [ClickTest]::SetForegroundWindow($found)|Out-Null
 Start-Sleep -Milliseconds 200
-# Position cursor over the URL text (approx row 5, middle of "https://example.com")
-# Each char is roughly 8px wide, URL starts ~5 chars in on the 5th line
-# Row height is ~17px with title bar offset
+# URLs fill every output row; click within the first few characters.
 $pt=New-Object ClickTest+POINT; $pt.X=120; $pt.Y=100
 [ClickTest]::ClientToScreen($found,[ref]$pt)|Out-Null
 [ClickTest]::SetCursorPos($pt.X,$pt.Y)|Out-Null
@@ -661,9 +645,12 @@ else{Write-Output "BROWSER_OPENED=false"}
         echo "  ⊘ Could not verify browser opened (may need manual Ctrl+click test)"
     fi
 
+    local responsive
+    responsive="$(get_val "$(ps -Action responsive -ProcessId "$pid")" RESPONSIVE)"
+    if assert_eq "Terminal responds after Ctrl+click" "true" "${responsive,,}"; then
+        PASS=$((PASS + 1))
+    fi
     ps -Action kill -ProcessId "$pid" 2>/dev/null || true
-    PASS=$((PASS + 1))
-    echo "  ● PASSED"
 }
 
 test_notifications() {

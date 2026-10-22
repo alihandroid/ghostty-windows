@@ -34,6 +34,10 @@ pub const must_draw_from_app_thread = false;
 /// core_app.tick() is called.
 const WM_APP_WAKEUP: u32 = w32.WM_APP + 1;
 
+/// The core holds the renderer lock during open_url, and ShellExecuteW pumps
+/// messages whose handlers take that lock, so the URL is opened later.
+const WM_APP_OPEN_URL: u32 = w32.WM_APP + 4;
+
 /// Timer ID for the quit-after-last-window-closed delay.
 const QUIT_TIMER_ID: usize = 1;
 
@@ -263,7 +267,11 @@ pub fn run(self: *App) !void {
             break;
         }
         if (result < 0) return error.Win32Error;
-        if (self.quit_requested) break;
+        if (self.quit_requested) {
+            // GetMessageW already removed this message from the queue.
+            self.discardOpenUrlRequest(msg);
+            break;
+        }
 
         // Dispatch a global hotkey to its bound action.
         if (msg.message == w32.WM_HOTKEY) {
@@ -407,6 +415,7 @@ pub fn terminate(self: *App) void {
         // userdata=0 and falls through to DefWindowProc for any
         // messages during destruction (e.g. WM_DESTROY).
         _ = w32.SetWindowLongPtrW(hwnd, w32.GWLP_USERDATA, 0);
+        self.discardPendingOpenUrls();
         _ = w32.DestroyWindow(hwnd);
         self.msg_hwnd = null;
     }
@@ -663,21 +672,18 @@ pub fn performAction(
         },
 
         .open_url => {
-            // Open a URL using ShellExecuteW — the native Windows way.
-            // internal_os.open() uses std.process.Child which can hit
-            // unreachable on Windows, so we use ShellExecuteW directly.
-            var wbuf: [2048]u16 = undefined;
-            const wlen = std.unicode.utf8ToUtf16Le(&wbuf, value.url) catch return true;
-            if (wlen < wbuf.len) {
-                wbuf[wlen] = 0;
-                _ = w32.ShellExecuteW(
-                    null,
-                    std.unicode.utf8ToUtf16LeStringLiteral("open"),
-                    @ptrCast(&wbuf),
-                    null,
-                    null,
-                    w32.SW_SHOW,
-                );
+            // Deferred via WM_APP_OPEN_URL; the handler owns the copy.
+            if (value.url.len == 0) return true;
+            const hwnd = self.msg_hwnd orelse return true;
+            const alloc = self.core_app.alloc;
+            const owned = alloc.dupe(u8, value.url) catch {
+                log.warn("oom allocating url to open", .{});
+                return true;
+            };
+            const wparam: usize = @intFromPtr(owned.ptr);
+            const lparam: isize = @intCast(owned.len);
+            if (w32.PostMessageW(hwnd, WM_APP_OPEN_URL, wparam, lparam) == 0) {
+                alloc.free(owned);
             }
             return true;
         },
@@ -2431,6 +2437,42 @@ fn surfaceWndProc(
     }
 }
 
+/// Open a URL in the default handler. internal_os.open() uses
+/// std.process.Child which can hit unreachable on Windows, so we use
+/// ShellExecuteW directly.
+fn openUrlNow(url: []const u8) void {
+    var wbuf: [2048]u16 = undefined;
+    const wlen = std.unicode.utf8ToUtf16Le(&wbuf, url) catch return;
+    if (wlen >= wbuf.len) return;
+    wbuf[wlen] = 0;
+    _ = w32.ShellExecuteW(
+        null,
+        std.unicode.utf8ToUtf16LeStringLiteral("open"),
+        @ptrCast(&wbuf),
+        null,
+        null,
+        w32.SW_SHOW,
+    );
+}
+
+/// Posted payloads are not freed by DestroyWindow if we quit before
+/// dispatching them. Discard them without opening URLs during shutdown.
+fn discardPendingOpenUrls(self: *App) void {
+    const hwnd = self.msg_hwnd orelse return;
+    var msg: w32.MSG = undefined;
+    while (w32.PeekMessageW(&msg, hwnd, WM_APP_OPEN_URL, WM_APP_OPEN_URL, w32.PM_REMOVE) != 0) {
+        self.discardOpenUrlRequest(msg);
+    }
+}
+
+fn discardOpenUrlRequest(self: *App, msg: w32.MSG) void {
+    if (msg.message == WM_APP_OPEN_URL and msg.wParam != 0 and msg.lParam > 0) {
+        const ptr: [*]u8 = @ptrFromInt(msg.wParam);
+        const len: usize = @intCast(msg.lParam);
+        self.core_app.alloc.free(ptr[0..len]);
+    }
+}
+
 /// Window procedure for the message-only HWND (GhosttyMsg class).
 /// GWLP_USERDATA stores an *App pointer.
 fn msgWndProc(
@@ -2457,6 +2499,19 @@ fn msgWndProc(
             const ver = ptr[0..len];
             defer app.core_app.alloc.free(ver);
             app.showUpdateNotification(ver);
+        }
+        return 0;
+    }
+
+    if (msg == WM_APP_OPEN_URL) {
+        // wparam = heap pointer to the UTF-8 URL, lparam = length.
+        // We own the buffer and must free it after use.
+        if (wparam != 0 and lparam > 0) {
+            const ptr: [*]u8 = @ptrFromInt(wparam);
+            const len: usize = @intCast(lparam);
+            const url = ptr[0..len];
+            defer app.core_app.alloc.free(url);
+            openUrlNow(url);
         }
         return 0;
     }
@@ -2537,4 +2592,113 @@ fn msgWndProc(
 test "export terminal IO requires a surface target" {
     var app: App = undefined;
     try std.testing.expect(!app.exportTerminalIo(.app, "test contents"));
+}
+
+test "open URL is deferred and owns its input until dispatch" {
+    const testing = std.testing;
+    // A system message-only window lets us inspect the posted request
+    // without launching a browser or initializing a renderer.
+    const hwnd = w32.CreateWindowExW(
+        0,
+        std.unicode.utf8ToUtf16LeStringLiteral("STATIC"),
+        std.unicode.utf8ToUtf16LeStringLiteral(""),
+        0,
+        0,
+        0,
+        0,
+        0,
+        w32.HWND_MESSAGE,
+        null,
+        null,
+        null,
+    ) orelse return error.Win32Error;
+    defer _ = w32.DestroyWindow(hwnd);
+
+    var core_app: CoreApp = undefined;
+    core_app.alloc = testing.allocator;
+    var app: App = undefined;
+    app.core_app = &core_app;
+    app.msg_hwnd = hwnd;
+    defer app.discardPendingOpenUrls();
+
+    // Invalid UTF-8 also keeps a regression to synchronous ShellExecuteW
+    // from launching a browser in the test runner.
+    const original = "https://example.com/\xff";
+    var url = original.*;
+    try testing.expect(try app.performAction(.app, .open_url, .{
+        .kind = .osc8,
+        .url = &url,
+    }));
+    @memset(&url, 'x');
+
+    var msg: w32.MSG = undefined;
+    try testing.expect(w32.PeekMessageW(&msg, hwnd, WM_APP_OPEN_URL, WM_APP_OPEN_URL, w32.PM_REMOVE) != 0);
+    const ptr: [*]u8 = @ptrFromInt(msg.wParam);
+    const owned = ptr[0..@as(usize, @intCast(msg.lParam))];
+    _ = w32.SetWindowLongPtrW(hwnd, w32.GWLP_USERDATA, @bitCast(@intFromPtr(&app)));
+    defer _ = msgWndProc(hwnd, msg.message, msg.wParam, msg.lParam);
+    try testing.expectEqualStrings(original, owned);
+}
+
+test "open URL frees undelivered requests" {
+    const testing = std.testing;
+    const hwnd = w32.CreateWindowExW(
+        0,
+        std.unicode.utf8ToUtf16LeStringLiteral("STATIC"),
+        std.unicode.utf8ToUtf16LeStringLiteral(""),
+        0,
+        0,
+        0,
+        0,
+        0,
+        w32.HWND_MESSAGE,
+        null,
+        null,
+        null,
+    ) orelse return error.Win32Error;
+    var window_alive = true;
+    defer if (window_alive) {
+        _ = w32.DestroyWindow(hwnd);
+    };
+
+    var core_app: CoreApp = undefined;
+    core_app.alloc = testing.allocator;
+    var app: App = undefined;
+    app.core_app = &core_app;
+    app.msg_hwnd = hwnd;
+    defer app.discardPendingOpenUrls();
+
+    try testing.expect(try app.performAction(.app, .open_url, .{
+        .kind = .osc8,
+        .url = "",
+    }));
+    var msg: w32.MSG = undefined;
+    try testing.expectEqual(@as(i32, 0), w32.PeekMessageW(&msg, hwnd, WM_APP_OPEN_URL, WM_APP_OPEN_URL, w32.PM_REMOVE));
+
+    // The testing allocator detects leaks both when shutdown discards a
+    // successfully posted request and when PostMessageW fails.
+    for (0..2) |_| {
+        try testing.expect(try app.performAction(.app, .open_url, .{
+            .kind = .osc8,
+            .url = "https://example.com/\xff",
+        }));
+    }
+    // One request has already been dequeued when run() notices a quit;
+    // the other is still pending when terminate() destroys the HWND.
+    try testing.expect(w32.PeekMessageW(&msg, hwnd, WM_APP_OPEN_URL, WM_APP_OPEN_URL, w32.PM_REMOVE) != 0);
+    app.discardOpenUrlRequest(msg);
+    app.discardPendingOpenUrls();
+    try testing.expectEqual(@as(i32, 0), w32.PeekMessageW(&msg, hwnd, WM_APP_OPEN_URL, WM_APP_OPEN_URL, w32.PM_REMOVE));
+
+    try testing.expect(w32.DestroyWindow(hwnd) != 0);
+    window_alive = false;
+    try testing.expect(try app.performAction(.app, .open_url, .{
+        .kind = .osc8,
+        .url = "https://example.com/\xff",
+    }));
+    app.msg_hwnd = null;
+    try testing.expect(try app.performAction(.app, .open_url, .{
+        .kind = .osc8,
+        .url = "https://example.com/\xff",
+    }));
 }

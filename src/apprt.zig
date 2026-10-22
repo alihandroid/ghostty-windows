@@ -14,9 +14,11 @@ const structs = @import("apprt/structs.zig");
 
 pub const action = @import("apprt/action.zig");
 pub const ipc = @import("apprt/ipc.zig");
-pub const gtk = @import("apprt/gtk.zig");
+// Only import runtimes whose dependencies are configured. Importing an
+// inactive runtime also discovers its tests, even when it is not selected.
+pub const gtk = if (build_config.app_runtime == .gtk) @import("apprt/gtk.zig") else struct {};
 pub const none = @import("apprt/none.zig");
-pub const win32 = @import("apprt/win32.zig");
+pub const win32 = if (build_config.app_runtime == .win32) @import("apprt/win32.zig") else struct {};
 pub const browser = @import("apprt/browser.zig");
 pub const embedded = @import("apprt/embedded.zig");
 pub const surface = @import("apprt/surface.zig");

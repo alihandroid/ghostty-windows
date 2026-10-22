@@ -7,6 +7,7 @@
 #   sendkeys    — Send keystrokes to ghostty window
 #   sendtext    — Type text into ghostty window
 #   check       — Check if ghostty window exists, output title + size
+#   responsive  — Check that the window processes messages within a timeout
 #   child-count — Count direct child processes of the test executable
 #   close       — Close ghostty window gracefully
 #   kill        — Force-kill ghostty process
@@ -19,7 +20,8 @@ param(
     [string]$Action,
 
     [string]$ExePath,
-    [string]$Args,
+    [Alias("Args")]
+    [string]$LaunchArgs,
     [string]$OutputPath,
     [string]$Keys,
     [string]$Text,
@@ -82,6 +84,10 @@ public class Win32Test {
 
     [DllImport("user32.dll")]
     public static extern IntPtr SendMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern IntPtr SendMessageTimeout(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam,
+        uint flags, uint timeout, out IntPtr result);
 
     [DllImport("user32.dll")]
     public static extern bool MoveWindow(IntPtr hWnd, int X, int Y, int nWidth, int nHeight, bool bRepaint);
@@ -180,8 +186,8 @@ function Invoke-Launch {
     # Use Start-Process -PassThru instead of ProcessStartInfo with
     # RedirectStandardError. Stderr redirect can hang on debug builds
     # and even on release builds when ConPTY produces debug output.
-    if ($Args) {
-        $proc = Start-Process -FilePath $exe -ArgumentList $Args -PassThru
+    if ($LaunchArgs) {
+        $proc = Start-Process -FilePath $exe -ArgumentList $LaunchArgs -PassThru
     } else {
         $proc = Start-Process -FilePath $exe -PassThru
     }
@@ -307,6 +313,21 @@ function Invoke-Close {
     Write-Output "CLOSED=true"
 }
 
+function Invoke-Responsive {
+    $win = Find-GhosttyWindow -ProcessId $ProcessId -DirectHwnd $Hwnd
+    if (-not $win) {
+        Write-Output "RESPONSIVE=false"
+        return
+    }
+
+    $result = [IntPtr]::Zero
+    # WM_NULL with SMTO_BLOCK | SMTO_ABORTIFHUNG bounds this probe even
+    # when a callback deadlocks the application thread.
+    $ok = [Win32Test]::SendMessageTimeout($win.Handle, 0, [IntPtr]::Zero, [IntPtr]::Zero,
+        0x0003, 2000, [ref]$result)
+    Write-Output "RESPONSIVE=$($ok -ne [IntPtr]::Zero)"
+}
+
 function Invoke-Resize {
     $win = Find-GhosttyWindow -ProcessId $ProcessId -DirectHwnd $Hwnd
     if (-not $win) {
@@ -406,6 +427,7 @@ switch ($Action.ToLower()) {
     "sendkeys"        { Invoke-SendKeys }
     "sendtext"        { Invoke-SendText }
     "check"           { Invoke-Check }
+    "responsive"      { Invoke-Responsive }
     "child-count"     { Invoke-ChildCount }
     "close"           { Invoke-Close }
     "resize"          { Invoke-Resize }

@@ -125,6 +125,7 @@ pub const WM_APP: u32 = 0x8000;
 pub const WM_QUIT: u32 = 0x0012;
 pub const WM_CLOSE: u32 = 0x0010;
 pub const WM_DESTROY: u32 = 0x0002;
+pub const PM_REMOVE: u32 = 0x0001;
 pub const WM_SIZE: u32 = 0x0005;
 // WM_SIZE wParam values.
 pub const SIZE_RESTORED: usize = 0;
@@ -386,6 +387,14 @@ pub extern "user32" fn GetMessageW(
     hWnd: ?HWND,
     wMsgFilterMin: u32,
     wMsgFilterMax: u32,
+) callconv(.winapi) i32;
+
+pub extern "user32" fn PeekMessageW(
+    lpMsg: *MSG,
+    hWnd: ?HWND,
+    wMsgFilterMin: u32,
+    wMsgFilterMax: u32,
+    wRemoveMsg: u32,
 ) callconv(.winapi) i32;
 
 pub extern "user32" fn TranslateMessage(
