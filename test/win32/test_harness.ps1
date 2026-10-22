@@ -248,6 +248,7 @@ function Invoke-Screenshot {
 }
 
 function Invoke-SendKeys {
+    Assert-IsolatedInputDesktop
     $win = Find-GhosttyWindow -ProcessId $ProcessId -DirectHwnd $Hwnd
     if (-not $win) {
         Write-Error "No ghostty window found"
@@ -265,6 +266,7 @@ function Invoke-SendKeys {
 }
 
 function Invoke-SendText {
+    Assert-IsolatedInputDesktop
     $win = Find-GhosttyWindow -ProcessId $ProcessId -DirectHwnd $Hwnd
     if (-not $win) {
         Write-Error "No ghostty window found"
@@ -280,6 +282,15 @@ function Invoke-SendText {
         [System.Windows.Forms.SendKeys]::SendWait($escaped)
     }
     Write-Output "SENT_TEXT=$Text"
+}
+
+function Assert-IsolatedInputDesktop {
+    # SendKeys injects into the foreground desktop, not a particular HWND.
+    # A successful ownership check or SetForegroundWindow call cannot prevent
+    # focus changing before/during injection. Never use it on a shared desktop.
+    if ($env:GHOSTTY_TEST_ISOLATED_DESKTOP -ne "1") {
+        throw "Global keyboard injection is disabled. Run input tests on a dedicated desktop and explicitly set GHOSTTY_TEST_ISOLATED_DESKTOP=1."
+    }
 }
 
 function Invoke-Check {

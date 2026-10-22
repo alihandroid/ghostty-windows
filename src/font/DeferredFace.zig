@@ -164,7 +164,7 @@ pub const WebCanvas = struct {
 pub fn deinit(self: *DeferredFace) void {
     switch (options.backend) {
         .fontconfig_freetype => if (self.fc) |*fc| fc.deinit(),
-        .freetype => if (comptime builtin.os.tag == .windows) {
+        .freetype => if (comptime builtin.target.os.tag == .windows) {
             if (self.dw) |*d| d.deinit();
         },
         .freetype_windows => if (self.win) |*w| w.deinit(),
@@ -257,7 +257,7 @@ pub fn load(
         // On Windows with freetype backend, we use DirectWrite for discovery
         // and FreeType for rendering. On other platforms, freetype has no
         // discovery mechanism so reaching this is unreachable.
-        .freetype => if (comptime builtin.os.tag == .windows)
+        .freetype => if (comptime builtin.target.os.tag == .windows)
             try self.loadDirectWrite(lib, opts)
         else
             unreachable,
@@ -467,7 +467,7 @@ pub fn hasCodepoint(self: DeferredFace, cp: u32, p: ?Presentation) bool {
             return face.glyphIndex(cp) != null;
         },
 
-        .freetype => if (comptime builtin.os.tag == .windows) {
+        .freetype => if (comptime builtin.target.os.tag == .windows) {
             if (self.dw) |dw_face| return dw_face.hasCharacter(cp);
         },
     }
@@ -490,14 +490,14 @@ pub const Wasm = struct {
     }
 
     fn deferred_face_new_(ptr: [*]const u8, len: usize, presentation: u16) !*DeferredFace {
-        const font_str = try alloc.dupeZ(u8, ptr[0..len]);
+        const font_str = try alloc.dupeSentinel(u8, ptr[0..len], 0);
         errdefer alloc.free(font_str);
 
         var face: DeferredFace = .{
             .wc = .{
                 .alloc = alloc,
                 .font_str = font_str,
-                .presentation = @enumFromInt(presentation),
+                .presentation = @fromBackingInt(presentation),
             },
         };
         errdefer face.deinit();

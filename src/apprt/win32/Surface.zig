@@ -337,7 +337,7 @@ pub fn initWithOptions(
         config.@"shell-integration" = .detect;
     }
     if (options.title) |title| {
-        config.title = try config.arenaAlloc().dupeZ(u8, title);
+        config.title = try config.arenaAlloc().dupeSentinel(u8, title, 0);
     }
 
     // Initialize the core surface. This sets up fonts, the renderer, PTY,
@@ -465,6 +465,11 @@ fn deinitGui(self: *Surface) void {
     log.debug("surface deinit: complete", .{});
 }
 
+/// WGL contexts are per-surface; the shared renderer device has no options.
+pub fn renderDeviceOptions(_: *Surface) !@import("../../renderer.zig").Device.Options {
+    return .{};
+}
+
 /// Recreate the WGL context after GPU context loss (driver reset/TDR)
 /// and make it current. Renderer-thread only: the GUI thread touches
 /// hdc/hglrc only before the renderer thread spawns (init) and after
@@ -474,10 +479,8 @@ fn deinitGui(self: *Surface) void {
 pub fn recreateGLContext(self: *Surface) !void {
     const hdc = self.hdc orelse return error.Win32Error;
 
-    // Create the new context before deleting the old one so a failure
-    // here leaves the old handle in place: the core surface deinit
-    // makes hglrc current on the GUI thread again after joining the
-    // renderer thread, so it must never be null.
+    // Create the new context before deleting the old one so a failed
+    // allocation does not discard the surface's last context handle.
     const new = w32.wglCreateContext(hdc) orelse return error.Win32Error;
 
     _ = w32.wglMakeCurrent(null, null);
@@ -772,7 +775,7 @@ pub fn clipboardRequest(
             const paths = (try hdropPathsToUtf8(alloc, @ptrCast(hdrop_handle))) orelse
                 break :hdrop;
             defer alloc.free(paths);
-            break :blk try alloc.dupeZ(u8, paths);
+            break :blk try alloc.dupeSentinel(u8, paths, 0);
         }
 
         const hglobal = w32.GetClipboardData(w32.CF_UNICODETEXT) orelse
@@ -792,9 +795,10 @@ pub fn clipboardRequest(
             return .unavailable;
         };
         defer alloc.free(utf8);
-        break :blk try alloc.dupeZ(
+        break :blk try alloc.dupeSentinel(
             u8,
             normalizeWindowsClipboardNewlines(utf8),
+            0,
         );
     };
     defer alloc.free(utf8z);
@@ -1115,9 +1119,9 @@ fn updateSearchCountLabel(self: *Surface) void {
         const total = self.search_total orelse break :blk "";
         if (total == 0) break :blk "0/0";
         if (self.search_selected) |sel| {
-            break :blk std.fmt.bufPrint(&buf8, "{d}/{d}", .{ sel + 1, total }) catch "";
+            break :blk std.mem.print(&buf8, "{d}/{d}", .{ sel + 1, total }) catch "";
         }
-        break :blk std.fmt.bufPrint(&buf8, "-/{d}", .{total}) catch "";
+        break :blk std.mem.print(&buf8, "-/{d}", .{total}) catch "";
     };
     var buf16: [64]u16 = undefined;
     const len16 = std.unicode.utf8ToUtf16Le(&buf16, text8) catch 0;
@@ -1589,7 +1593,7 @@ fn positionCommandPalette(self: *Surface) void {
 fn filterPaletteEntries(self: *Surface, filter: []const u8) void {
     var count: u16 = 0;
     for (palette_entries, 0..) |entry, i| {
-        if (filter.len == 0 or std.ascii.indexOfIgnoreCase(entry.name, filter) != null) {
+        if (filter.len == 0 or std.ascii.findIgnoreCase(entry.name, filter) != null) {
             self.palette_filtered[count] = @intCast(i);
             count += 1;
         }
@@ -1599,7 +1603,7 @@ fn filterPaletteEntries(self: *Surface, filter: []const u8) void {
     const user = self.app.config.@"command-palette-entry".value.items;
     const user_len = @min(user.len, MAX_USER_PALETTE_ENTRIES);
     for (user[0..user_len], 0..) |entry, i| {
-        if (filter.len == 0 or std.ascii.indexOfIgnoreCase(entry.title, filter) != null) {
+        if (filter.len == 0 or std.ascii.findIgnoreCase(entry.title, filter) != null) {
             self.palette_filtered[count] = @intCast(palette_entries.len + i);
             count += 1;
         }
@@ -2834,7 +2838,7 @@ fn writeWin32InputSequence(
     rc: u16,
 ) void {
     var buf: [64]u8 = undefined;
-    const seq = std.fmt.bufPrint(&buf, "\x1b[{};{};{};{};{};{}_", .{
+    const seq = std.mem.print(&buf, "\x1b[{};{};{};{};{};{}_", .{
         vk, sc, uc, kd, cs, rc,
     }) catch return;
 

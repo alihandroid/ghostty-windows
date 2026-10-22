@@ -29,13 +29,14 @@ The goal is to track the upstream main branch while maintaining a native Windows
 
 ## Status
 
-**Feature-complete** — 100% apprt action coverage (66/66 actions handled),
-synced with upstream main. The terminal is ready for daily use.
+Native Windows runtime using the shared upstream terminal core. Platform-specific
+behavior is implemented separately; handling an action is not a guarantee of
+macOS/GTK feature parity.
 
 ### Features
 
 **Terminal**
-- Full VT sequence support with OpenGL 4.6 rendering (WGL)
+- Shared upstream terminal emulation with OpenGL 4.3+ rendering (WGL)
 - FreeType + HarfBuzz fonts with DirectWrite system font discovery
 - ConPTY shell spawning (cmd.exe, PowerShell, WSL)
 - Win32 Input Mode (mode 9001) for full Unicode through ConPTY
@@ -44,7 +45,7 @@ synced with upstream main. The terminal is ready for daily use.
   window anchored to it
 - AltGr layouts (German, Polish, …) encode correctly
 - Per-monitor DPI awareness, window resize with grid reflow
-- 463 built-in color themes (same as macOS)
+- Bundled upstream color themes
 
 **Windows & Tabs**
 - Multiple windows, tabbed interface with custom GDI tab bar
@@ -109,11 +110,18 @@ synced with upstream main. The terminal is ready for daily use.
 - Inspector (debug overlay) — acknowledged but no Win32 UI yet
 - `undo`/`redo` — macOS NSUndoManager only, no Win32 equivalent
 - `secure_input` — macOS EnableSecureEventInput only
-- Release build + installer (MSI/MSIX) — not yet packaged
+- Tab overview — no native overview UI yet
+- Portable release ZIP is supported; MSI/MSIX installers are not implemented
+- Terminal-supplied HTTP(S)/mailto links open directly; custom protocols require
+  confirmation. Untrusted paths and `file:` URLs are blocked until Windows has
+  safe canonical-file classification. Ghostty-generated text/HTML exports still open.
+- Program-requested window resizing (CSI 8 t) is disabled by default; enable
+  `vt-window-resize-allowed` to allow it for a normal single-tab, unsplit window.
+  Zero dimensions are preserved and oversized requests are clamped to the monitor.
 
 ## Building
 
-Requires [Zig](https://ziglang.org/download/) 0.16.0.
+Requires [Zig](https://ziglang.org/download/) 0.17.0.
 
 ### Native build on Windows (recommended)
 
@@ -162,7 +170,7 @@ spawns `cmd.exe` with a minimal environment block; it passes on Windows CI.
 ### Release build
 
 ```bash
-zig build -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu -Doptimize=ReleaseFast
+zig build -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu -Doptimize=fast
 ```
 
 To debug a release build with stderr visible, add `-Dwindows-console=true`
@@ -312,6 +320,12 @@ A test harness runs from WSL2 using PowerShell automation:
 bash test/win32/ghostty_test.sh all
 ```
 
+Keyboard/mouse injection tests must run on a dedicated desktop. They are
+disabled unless `GHOSTTY_TEST_ISOLATED_DESKTOP=1` is explicitly set in Windows
+(propagate it through `WSLENV` when launching from WSL). Never enable this on
+the desktop where you are working: Windows focus requests can fail or race.
+The program-resize test uses a controlled child process instead of desktop input.
+
 25+ automated tests cover: launch/close, window properties, keyboard input, multiple windows, clipboard, config loading, scrollbar, close confirmation, URL detection, notifications, window sizing, window resize (real assertion), search bar, config reload, tabs (new/switch/close), opacity, command palette, tab drag reorder, inline tab rename, split panes, font zoom, fullscreen toggle, open config, and quick terminal.
 
 Tab and split tests run in PowerShell sessions:
@@ -323,7 +337,15 @@ powershell.exe -ExecutionPolicy Bypass -File test/win32/test_splits.ps1 -ExePath
 
 ## Syncing with Upstream
 
-This fork tracks `ghostty-org/ghostty` main branch. To sync:
+This fork tracks `ghostty-org/ghostty` main branch.
+
+Last integrated upstream: `f54340ad7` (2026-10-21). This includes the shared
+terminal fixes, Kitty graphics/render-state and snapshot updates, checksum
+reporting controls, paste protection, and libghostty-vt API updates. Windows
+retains WGL/ConPTY; upstream's GTK EGL/DMABUF presentation path is Linux-specific.
+The toolchain and Windows CI now use Zig 0.17.0 (`-Doptimize=fast` for releases).
+
+To sync:
 
 ```bash
 git remote add upstream https://github.com/ghostty-org/ghostty.git

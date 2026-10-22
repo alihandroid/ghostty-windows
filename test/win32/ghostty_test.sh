@@ -9,6 +9,19 @@
 
 set -uo pipefail
 
+# Most legacy cases use desktop-global keyboard/mouse injection. Refuse them
+# before launching or cleaning up anything on a developer's shared desktop.
+case "${1:-all}" in
+    list|resize|window_properties|program_window_resize) ;;
+    *)
+        if [ "${GHOSTTY_TEST_ISOLATED_DESKTOP:-}" != "1" ]; then
+            echo "Input tests require a dedicated desktop and GHOSTTY_TEST_ISOLATED_DESKTOP=1." >&2
+            echo "Safe cases: program_window_resize, resize, window_properties." >&2
+            exit 2
+        fi
+        ;;
+esac
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 HARNESS_PS1="$(wslpath -w "$SCRIPT_DIR/test_harness.ps1")"
@@ -566,6 +579,11 @@ test_close_confirmation() {
 }
 
 test_url_detection() {
+    if [ "${GHOSTTY_TEST_ISOLATED_DESKTOP:-}" != "1" ]; then
+        echo "  ⊘ URL click test requires a dedicated input desktop"
+        SKIP=$((SKIP + 1))
+        return
+    fi
     echo "▶ test_url_detection"
     local output
     GHOSTTY_HWND=0
@@ -651,6 +669,17 @@ else{Write-Output "BROWSER_OPENED=false"}
         PASS=$((PASS + 1))
     fi
     ps -Action kill -ProcessId "$pid" 2>/dev/null || true
+}
+
+test_program_window_resize() {
+    echo "▶ test_program_window_resize (no desktop input)"
+    local script
+    script="$(wslpath -w "$SCRIPT_DIR/test_program_resize.ps1")"
+    if powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$script" -ExePath "$GHOSTTY_EXE"; then
+        PASS=$((PASS + 1))
+    else
+        FAIL=$((FAIL + 1))
+    fi
 }
 
 test_auto_update_settings() {
@@ -1707,6 +1736,7 @@ list_tests() {
     echo "  close_confirmation  — Close blocked by confirmation dialog"
     echo "  url_detection       — URL displayed in terminal for Ctrl+click"
     echo "  auto_update_settings — Automatic update modes and forced manual checks"
+    echo "  program_window_resize — Opt-in CSI 8 t resize and zero dimensions"
     echo "  notifications      — Desktop notification via OSC 9"
     echo "  window_size_config — Custom window size from config"
     echo "  search             — Search bar open/close/input"
@@ -1741,6 +1771,7 @@ run_test() {
         close_confirmation)  test_close_confirmation ;;
         url_detection)       test_url_detection ;;
         auto_update_settings) test_auto_update_settings ;;
+        program_window_resize) test_program_window_resize ;;
         notifications)       test_notifications ;;
         window_size_config)  test_window_size_config ;;
         search)              test_search ;;
@@ -1795,6 +1826,8 @@ case "${1:-all}" in
         test_url_detection
         echo ""
         test_auto_update_settings
+        echo ""
+        test_program_window_resize
         echo ""
         test_notifications
         echo ""
