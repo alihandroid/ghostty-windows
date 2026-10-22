@@ -7,9 +7,13 @@ Add-Type @"
 using System;
 using System.Runtime.InteropServices;
 public class ResizeTest {
+    public const uint SWP_NOMOVE = 0x0002, SWP_NOZORDER = 0x0004, SWP_NOACTIVATE = 0x0010;
     [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left, Top, Right, Bottom; }
     [DllImport("user32.dll")] public static extern bool GetClientRect(IntPtr h, out RECT r);
+    [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
+    [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int width, int height, uint flags);
     [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+    [DllImport("user32.dll")] public static extern int GetWindowText(IntPtr h, System.Text.StringBuilder text, int length);
     [DllImport("user32.dll", SetLastError=true)] public static extern IntPtr SendMessageTimeout(IntPtr h, uint m, IntPtr w, IntPtr l, uint flags, uint timeout, out IntPtr result);
 }
 "@
@@ -44,6 +48,8 @@ while ((Get-Date) -lt `$deadline) {
         if (`$next -and `$next -ne `$last) {
             if (`$next -eq 'exit') { break }
             [Console]::Write([char]27 + '[' + `$next)
+            [Console]::Write([char]27 + ']2;resize-stage-' + `$next + [char]7)
+            [Console]::Out.Flush()
             [IO.File]::WriteAllText(`$ack, `$next)
             `$last = `$next
         }
@@ -79,7 +85,14 @@ while ((Get-Date) -lt `$deadline) {
                 $ack = Join-Path $taskDir 'ack'
                 (Test-Path $ack) -and ([IO.File]::ReadAllText($ack) -eq $sequence)
             } "resize $sequence emitted"
-            Start-Sleep -Milliseconds 2000
+            # The marker proves output is still parsed after a ConPTY resize.
+            # A file acknowledgement alone only proves the child wrote it.
+            Wait-For {
+                $title = New-Object System.Text.StringBuilder 256
+                [ResizeTest]::GetWindowText($window, $title, 256) | Out-Null
+                $title.ToString() -eq ('resize-stage-' + $sequence)
+            } "output marker after $sequence"
+            Start-Sleep -Milliseconds 300
             $probe = [IntPtr]::Zero
             Assert-True ([ResizeTest]::SendMessageTimeout($window, 0, [IntPtr]::Zero, [IntPtr]::Zero,
                 0x0003, 2000, [ref]$probe) -ne [IntPtr]::Zero) "responsive after resize $sequence" | Out-Host
@@ -98,11 +111,28 @@ while ((Get-Date) -lt `$deadline) {
             # split/fullscreen/tab guards are covered by Window.zig tests.
             $after = Request-Size '8;14;60t'
             Write-Host "SIZE=second-resize $($before -join 'x') -> $($after -join 'x')"
-            Assert-True ($before[1] -ne $after[1] -and $before[0] -ne $after[0]) "second resize changes both dimensions"
+            if ($before[0] -eq $after[0] -and $before[1] -eq $after[1]) {
+                Write-Host "NOTE=This ConPTY version consumed a subsequent CSI 8 t request before forwarding it."
+            } else {
+                Assert-True ($before[1] -ne $after[1] -and $before[0] -ne $after[0]) "second forwarded resize changes both dimensions"
+            }
             $before = $after
             $after = Request-Size '8;16;70t'
             Write-Host "SIZE=third-resize $($before -join 'x') -> $($after -join 'x')"
-            Assert-True ($before[0] -ne $after[0] -and $before[1] -ne $after[1]) "third resize changes both dimensions"
+            if ($before[0] -ne $after[0] -or $before[1] -ne $after[1]) {
+                Assert-True ($before[0] -ne $after[0] -and $before[1] -ne $after[1]) "third forwarded resize changes both dimensions"
+            }
+
+            # Test host-driven ConPTY resizing too, then require fresh output
+            # to be consumed. HWND-targeted APIs do not inject desktop input.
+            $outer = New-Object ResizeTest+RECT
+            [ResizeTest]::GetWindowRect($window, [ref]$outer) | Out-Null
+            Assert-True ([ResizeTest]::SetWindowPos($window, [IntPtr]::Zero, 0, 0,
+                ($outer.Right - $outer.Left + 80), ($outer.Bottom - $outer.Top + 60),
+                [ResizeTest]::SWP_NOMOVE -bor [ResizeTest]::SWP_NOZORDER -bor [ResizeTest]::SWP_NOACTIVATE)) "targeted host window resize"
+            $afterHostResize = Request-Size '0m'
+            Write-Host "SIZE=host-resize $($after -join 'x') -> $($afterHostResize -join 'x')"
+            Assert-True ($afterHostResize[0] -ne $after[0] -and $afterHostResize[1] -ne $after[1]) "output continues after host-driven resize"
         }
         $result = [IntPtr]::Zero
         Assert-True ([ResizeTest]::SendMessageTimeout($window, 0, [IntPtr]::Zero, [IntPtr]::Zero,

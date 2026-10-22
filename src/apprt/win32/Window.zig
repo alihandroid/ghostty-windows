@@ -1471,8 +1471,11 @@ pub fn resizeSurface(self: *Window, surface: *Surface, size: apprt.action.Resize
     if (w32.GetWindowRect(hwnd, &outer) == 0 or
         w32.GetClientRect(surface_hwnd, &client) == 0) return false;
 
-    var width = resizedDimension(size.width, surface.scale, client.right - client.left, outer.right - outer.left);
-    var height = resizedDimension(size.height, surface.scale, client.bottom - client.top, outer.bottom - outer.top);
+    // The surface's drawable width excludes a reserved (non-overlay)
+    // scrollbar strip; the child HWND's client rectangle does not.
+    const current = surface.getSize() catch return false;
+    var width = resizedDimension(size.width, surface.scale, @intCast(current.width), outer.right - outer.left);
+    var height = resizedDimension(size.height, surface.scale, @intCast(current.height), outer.bottom - outer.top);
     var monitor: w32.MONITORINFO = undefined;
     monitor.cbSize = @sizeOf(w32.MONITORINFO);
     if (w32.GetMonitorInfoW(w32.MonitorFromWindow(hwnd, w32.MONITOR_DEFAULTTONEAREST), &monitor) != 0) {
@@ -1510,6 +1513,9 @@ test "program resize native window guards and zero dimensions" {
     var surface: Surface = undefined;
     surface.hwnd = child;
     surface.scale = 1;
+    // Simulate a 20-pixel scrollbar reservation within the 200-pixel child.
+    surface.width = 180;
+    surface.height = 100;
     var window: Window = .{ .app = undefined, .hwnd = hwnd, .tab_count = 1 };
     window.tab_active_surface[0] = &surface;
     window.tab_trees[0] = .{ .arena = undefined, .nodes = &.{.{ .leaf = &surface }}, .zoomed = null };
@@ -1519,7 +1525,7 @@ test "program resize native window guards and zero dimensions" {
     try testing.expect(w32.GetWindowRect(hwnd, &before) != 0);
     try testing.expect(window.resizeSurface(&surface, .{ .width = 220, .height = 0 }));
     try testing.expect(w32.GetWindowRect(hwnd, &after) != 0);
-    try testing.expectEqual(before.right - before.left + 20, after.right - after.left);
+    try testing.expectEqual(before.right - before.left + 40, after.right - after.left);
     try testing.expectEqual(before.bottom - before.top, after.bottom - after.top);
     before = after;
     try testing.expect(window.resizeSurface(&surface, .{ .width = 0, .height = 120 }));

@@ -565,7 +565,9 @@ pub fn resize(
     }
 
     if (comptime builtin.target.os.tag == .windows) {
+        log.debug("resizing ConPTY to {}x{}", .{ grid_size.columns, grid_size.rows });
         try self.backend.resize(grid_size, size.terminal());
+        log.debug("ConPTY resize complete", .{});
     }
 
     // Mail the renderer so that it can update the GPU and re-render

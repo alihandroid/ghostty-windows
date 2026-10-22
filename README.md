@@ -118,6 +118,8 @@ macOS/GTK feature parity.
 - Program-requested window resizing (CSI 8 t) is disabled by default; enable
   `vt-window-resize-allowed` to allow it for a normal single-tab, unsplit window.
   Zero dimensions are preserved and oversized requests are clamped to the monitor.
+  ConPTY versions can consume subsequent or zero-valued resize requests before
+  forwarding them, so Windows cannot guarantee that every CSI 8 t reaches Ghostty.
 
 ## Building
 

@@ -2094,6 +2094,7 @@ fn resizeWindow(
     self: *Surface,
     size: terminal.StreamAction.ResizeWindow,
 ) !void {
+    log.debug("program resize request rows={} columns={}", .{ size.rows, size.columns });
     if (!self.config.vt_window_resize_allowed) {
         log.info("resize_window requested, but disabled via config", .{});
         return;

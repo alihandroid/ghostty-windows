@@ -66,6 +66,7 @@ pub fn build(b: *std.Build) !void {
         "Run the app under valgrind",
     );
     const test_step = b.step("test", "Run tests");
+    const test_build_step = b.step("test-build", "Build tests without running them (compile check)");
     const test_lib_vt_step = b.step(
         "test-lib-vt",
         "Run libghostty-vt tests",
@@ -394,7 +395,9 @@ pub fn build(b: *std.Build) !void {
             const test_exe_install = b.addInstallArtifact(test_exe, .{});
             config.addPatchElf(test_exe, &test_exe_install.step);
             test_step.dependOn(&test_exe_install.step);
+            test_build_step.dependOn(&test_exe_install.step);
         }
+        test_build_step.dependOn(&test_exe.step);
         _ = try deps.add(test_exe);
 
         addGhosttyH(b, test_exe.root_module, config.baselineTarget(b.graph.io), .debug);

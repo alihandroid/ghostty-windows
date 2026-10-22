@@ -67,6 +67,9 @@ jobs:
               throw "The test harness did not refuse global input ($action)"
             }
           }
+          # The refusals are expected failures. GitHub's pwsh wrapper would
+          # otherwise propagate the last child process's exit code.
+          $global:LASTEXITCODE = 0
 
       - name: Test
         run: zig build test -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu

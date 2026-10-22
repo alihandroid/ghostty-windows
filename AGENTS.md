@@ -46,6 +46,8 @@ A file for [guiding coding agents](https://agents.md/).
   Add `-Dwindows-console=true` when release-mode stderr/stdout is needed.
 - Run the Windows compile and Zig tests with
   `zig build test -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu`.
+- From WSL, compile without running with `zig build test-build` and the same
+  target options; add `-Demit-test-exe=true` to install the test executable.
 - Run the Win32 integration suite from WSL with
   `bash test/win32/ghostty_test.sh all`. Add a focused automated test for
   each new Windows feature instead of relying only on manual verification.
