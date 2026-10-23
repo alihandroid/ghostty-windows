@@ -71,6 +71,16 @@ jobs:
           # otherwise propagate the last child process's exit code.
           $global:LASTEXITCODE = 0
 
+      - name: Test PowerShell shell integration (5.1 and 7)
+        shell: pwsh
+        run: |
+          foreach ($engine in @("powershell.exe", "pwsh.exe")) {
+            & $engine -NoProfile -NonInteractive -ExecutionPolicy Bypass -File test/win32/test_shell_integration.ps1
+            if ($LASTEXITCODE -ne 0) {
+              throw "Shell integration failed under $engine"
+            }
+          }
+
       - name: Test
         run: zig build test -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu
 

@@ -48,16 +48,24 @@ A file for [guiding coding agents](https://agents.md/).
   `zig build test -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu`.
 - From WSL, compile without running with `zig build test-build` and the same
   target options; add `-Demit-test-exe=true` to install the test executable.
-- Run the Win32 integration suite from WSL with
-  `bash test/win32/ghostty_test.sh all`. Add a focused automated test for
-  each new Windows feature instead of relying only on manual verification.
+- On a shared desktop, run the no-input Win32 case from WSL with
+  `bash test/win32/ghostty_test.sh program_window_resize`. Add a focused
+  automated test for each new Windows feature instead of relying only on
+  manual verification.
 - Global-input tests require a dedicated, isolated desktop. Never set
-  `GHOSTTY_TEST_ISOLATED_DESKTOP=1` on a shared working desktop; use the
-  no-input `program_window_resize` case there instead.
+  `GHOSTTY_TEST_ISOLATED_DESKTOP=1` on a shared working desktop. The `all`
+  suite and standalone tab/split/IME scripts are for that isolated desktop only.
 - Launch automated tests from a local Windows path such as `%TEMP%`, not a
   WSL UNC path. The test harness handles this for the main executable.
+- Standalone Zig test binaries also need a local Windows working directory
+  and snapshot/font fixtures. See `README.md` for the staging procedure.
+- Test PowerShell integration without GUI/input using
+  `powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File test/win32/test_shell_integration.ps1`;
+  repeat with `pwsh.exe`. Keep the integration script compatible with Windows
+  PowerShell 5.1: construct ESC as `[char]27`, not a backtick-e escape.
 - The Windows config is `%LOCALAPPDATA%\ghostty\config.ghostty`; the legacy
-  filename `config` is also loaded.
+  filename `config` is loaded first when present. `XDG_CONFIG_HOME` overrides
+  the configuration directory.
 
 ### Windows Resources and Packaging
 

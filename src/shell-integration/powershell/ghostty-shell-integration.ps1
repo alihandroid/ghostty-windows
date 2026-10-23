@@ -22,6 +22,9 @@ if (Test-Path Function:\prompt) {
 
 # Track prompt state for OSC 133 sequencing.
 $Script:__ghostty_prompt_state = 'initial'
+# Windows PowerShell 5.1 does not recognize the backtick-e escape sequence.
+# Construct ESC explicitly so both powershell.exe and pwsh.exe emit real VT.
+$Script:__ghostty_escape = [char]27
 
 function prompt {
     # Capture exit code before anything else can clobber it.
@@ -32,34 +35,34 @@ function prompt {
     # Skip on the very first prompt (no command has run yet).
     if ($Script:__ghostty_prompt_state -ne 'initial') {
         $exitCode = if ($cmdSuccess) { 0 } else { if ($realLASTEXITCODE) { $realLASTEXITCODE } else { 1 } }
-        [Console]::Write("`e]133;D;$exitCode`a")
+        [Console]::Write("$Script:__ghostty_escape]133;D;$exitCode`a")
     }
 
     # OSC 133;A — fresh line / new prompt.
-    [Console]::Write("`e]133;A`a")
+    [Console]::Write("$Script:__ghostty_escape]133;A`a")
 
     # Cursor shape: blinking bar at prompt (if cursor feature enabled).
     if ($GhosttyFeatures -contains 'cursor') {
-        [Console]::Write("`e[5 q")
+        [Console]::Write("$Script:__ghostty_escape[5 q")
     }
 
     # OSC 7 — report current working directory.
     $cwd = (Get-Location).Path -replace '\\', '/'
     # File URI: file://hostname/path
     $hostname = [System.Net.Dns]::GetHostName()
-    [Console]::Write("`e]7;file://$hostname/$cwd`a")
+    [Console]::Write("$Script:__ghostty_escape]7;file://$hostname/$cwd`a")
 
     # OSC 2 — window title (current directory).
     if ($GhosttyFeatures -contains 'title') {
         $leaf = Split-Path -Leaf (Get-Location)
-        [Console]::Write("`e]2;$leaf`a")
+        [Console]::Write("$Script:__ghostty_escape]2;$leaf`a")
     }
 
     # Call the original prompt to get the prompt string.
     $promptText = __ghostty_original_prompt
 
     # OSC 133;B — end of prompt, start of user input.
-    [Console]::Write("`e]133;B`a")
+    [Console]::Write("$Script:__ghostty_escape]133;B`a")
 
     $Script:__ghostty_prompt_state = 'prompt-end'
 
@@ -74,11 +77,11 @@ function prompt {
 if (Get-Module -Name PSReadLine -ErrorAction SilentlyContinue) {
     Set-PSReadLineKeyHandler -Key Enter -ScriptBlock {
         # OSC 133;C — end of input, start of output.
-        [Console]::Write("`e]133;C`a")
+        [Console]::Write("$Script:__ghostty_escape]133;C`a")
 
         # Reset cursor to default shape before command runs.
         if ($GhosttyFeatures -contains 'cursor') {
-            [Console]::Write("`e[0 q")
+            [Console]::Write("$Script:__ghostty_escape[0 q")
         }
 
         $Script:__ghostty_prompt_state = 'pre-exec'

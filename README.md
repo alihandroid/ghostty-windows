@@ -152,22 +152,19 @@ The same command works from Linux with the GNU ABI target
 ABI, which cannot cross-compile from Linux because it lacks the MSVC
 headers).
 
-On WSL, drop the Windows entries from `PATH` before building:
+If a WSL build fails with `AccessDenied` while probing an unreadable Windows
+`PATH` entry, use a Linux-only `PATH` for that build command:
 
 ```bash
-export PATH=$(echo "$PATH" | tr ':' '\n' | grep -v '^/mnt/c' | paste -sd:)
+ghostty_build_path="$(printf '%s' "$PATH" | tr ':' '\n' | awk '!/^\/mnt\/[A-Za-z]\//' | paste -sd: -)"
+PATH="$ghostty_build_path" zig build -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu
 ```
 
-WSL appends the Windows `PATH` by default, and one of its entries
-(`/mnt/c/Windows/system32/config/systemprofile/AppData/Local/Microsoft/WindowsApps`)
-is unreadable from Linux. Zig probes `PATH` for a system `cc` and reports
-the resulting `EACCES` as a bare `error: AccessDenied` with no indication
-of which file it came from. With the Windows entries removed, the full
-`ghostty.exe` cross-links and `zig build test -Dapp-runtime=win32` runs the
-test suite through WSL interop.
-
-One test, `Command: custom env vars`, fails under WSL interop because it
-spawns `cmd.exe` with a minimal environment block; it passes on Windows CI.
+This leaves the calling shell's `PATH` unchanged so `powershell.exe`, `cmd.exe`,
+and other Windows test tools remain available. Zig 0.17.0 must be on the Linux
+build path. Cross-compiling is not the same as running the native tests: use
+`test-build` to compile them, then run from a local Windows directory with their
+fixtures as described under [Testing](#testing).
 
 ### Release build
 
@@ -179,6 +176,22 @@ To debug a release build with stderr visible, add `-Dwindows-console=true`
 — it links against `/SUBSYSTEM:CONSOLE` instead of the default Windows
 GUI subsystem so the process gets a console attached.
 
+### Portable packaging
+
+From WSL with Zig 0.17.0 and Windows interop available:
+
+```bash
+bash dist/windows/package.sh
+```
+
+The ZIP is written to `dist/windows/ghostty-windows-x64-<version>.zip`.
+Extract it anywhere, keeping `ghostty.exe` beside the bundled `share/` tree.
+`share/terminfo/ghostty.terminfo` is the resource-directory sentinel; themes
+and automatic shell integration depend on that layout. Packaging does not
+install files under `%LOCALAPPDATA%`; that directory is used for configuration.
+Publishing a release uses an annotated `win-vX.Y.Z` tag; see
+[the release workflow](AGENTS.md#windows-resources-and-packaging).
+
 ## Keyboard Shortcuts
 
 All keybindings are configurable via the `keybind` config option. These are the defaults:
@@ -189,7 +202,7 @@ All keybindings are configurable via the `keybind` config option. These are the 
 |--------|----------|
 | New window | `Ctrl+Shift+N` |
 | Close surface (tab/pane) | `Ctrl+Shift+W` |
-| Close window | `Ctrl+Shift+Q` |
+| Close window | `Alt+F4` |
 | Toggle fullscreen | `Ctrl+Enter` |
 | Command palette | `Ctrl+Shift+P` |
 | Open config file | `Ctrl+,` |
@@ -267,7 +280,12 @@ The `global:` prefix makes it work system-wide, even when Ghostty isn't focused.
 
 ## Configuration
 
-Ghostty reads its config file from `%LOCALAPPDATA%\ghostty\config` (or `%XDG_CONFIG_HOME%\ghostty\config` if set). Example:
+The preferred config file is `%LOCALAPPDATA%\ghostty\config.ghostty`.
+If `XDG_CONFIG_HOME` is set, use `%XDG_CONFIG_HOME%\ghostty\config.ghostty`
+instead. The legacy filename `config` is also supported. When both files
+exist, Ghostty loads `config` first, then `config.ghostty`.
+
+Example:
 
 ```
 # Font
@@ -290,6 +308,23 @@ keybind = global:ctrl+grave_accent=toggle_quick_terminal
 
 See the [upstream documentation](https://ghostty.org/docs/config) for the full list of config options. Most settings work on Windows — the exceptions are platform-specific options (GTK, macOS).
 
+### Windows update checks
+
+Automatic checks run at startup, at most once per hour. Set `auto-update = off`
+to disable those checks. Unset, `check`, and `download` all enable notification-only
+checks on Windows; updates are not downloaded or installed automatically.
+The `check_for_updates` action explicitly checks even when automatic checks are
+off or the hourly limit has not elapsed. `auto-update-channel` is macOS-only.
+
+### PowerShell integration
+
+Windows PowerShell 5.1 (`powershell.exe`) and PowerShell 7 (`pwsh.exe`) load
+the bundled integration automatically when shell integration is enabled.
+No PowerShell profile edit or fixed installation path is required. Keep the
+portable `share/` tree beside `ghostty.exe`; use `shell-integration = none`
+to disable integration. See the [implementation notes](src/shell-integration/README.md#powershell)
+for prompt markers, working-directory reporting, title, and cursor behavior.
+
 ## Architecture
 
 The Windows port adds a `win32` application runtime (`src/apprt/win32/`) alongside the existing GTK (Linux) and AppKit (macOS) runtimes. It reuses Ghostty's cross-platform core:
@@ -308,7 +343,11 @@ src/apprt/win32/
   Window.zig          — Top-level container HWND, tab bar, splits, tab lifecycle
   Surface.zig         — WS_CHILD HWND, WGL context, input, clipboard, search, command palette
   QuickTerminal.zig   — Quick terminal popup with slide animation
+  UntrustedUrl.zig    — Terminal-supplied URL validation and confirmation policy
   win32.zig           — Win32 API type definitions and extern declarations
+
+src/renderer/opengl/
+  WGLDevice.zig       — Windows adapter for the shared renderer device API
 
 src/shell-integration/powershell/
   ghostty-shell-integration.ps1  — PowerShell prompt marking, CWD, title
@@ -316,23 +355,94 @@ src/shell-integration/powershell/
 
 ## Testing
 
-A test harness runs from WSL2 using PowerShell automation:
+### Zig unit tests
+
+From a local Windows checkout:
+
+```powershell
+zig build test -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu
+# Prefer a filter for focused changes:
+zig build test -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu -Dtest-filter="program resize"
+```
+
+From WSL, compile without executing the Windows test runner:
+
+```bash
+zig build test-build -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu -Demit-test-exe=true
+```
+
+Add `-Dtest-filter="program resize"` to compile a focused test executable.
+The installed test binary is `zig-out/bin/ghostty-test.exe`.
+
+To run that binary from a WSL checkout, open PowerShell at the repository root
+and stage it with the reference fixtures in a fresh local Windows directory:
+
+```powershell
+$repo = (Get-Location).Path
+$testDir = Join-Path $env:TEMP ("ghostty-unit-" + [guid]::NewGuid().ToString("N"))
+New-Item -ItemType Directory -Path $testDir | Out-Null
+Copy-Item (Join-Path $repo 'zig-out\bin\ghostty-test.exe') (Join-Path $testDir 'ghostty-unit.exe')
+foreach ($fixture in @('src\terminal\snapshot\testdata', 'src\font\sprite\testdata', 'src\font\testdata')) {
+    $destination = Join-Path $testDir $fixture
+    New-Item -ItemType Directory -Path (Split-Path $destination) -Force | Out-Null
+    Copy-Item (Join-Path $repo $fixture) $destination -Recurse
+}
+Push-Location $testDir
+try {
+    & .\ghostty-unit.exe
+    if ($LASTEXITCODE -ne 0) { throw "Tests failed: $LASTEXITCODE" }
+} finally {
+    Pop-Location
+}
+```
+
+The local working directory matters: file-loading security tests reject UNC
+paths. Snapshot and font reference tests also need the fixtures above. Do not
+weaken security checks or assume a test is broken because its launch directory
+or reference files are wrong. The staging directory is left in `%TEMP%` for
+inspection.
+
+### Tests without desktop input
+
+After building the app, the WSL harness can run a controlled-child resize test:
+
+```bash
+bash test/win32/ghostty_test.sh program_window_resize
+```
+
+It uses a file handshake and owned window handles, not keyboard/mouse injection.
+The harness stages the app under Windows `%TEMP%`. The `resize` and
+`window_properties` cases also avoid global input.
+
+The PowerShell integration regression test captures VT output in memory and
+needs neither a GUI nor the app binary. Run from the repository root in Windows:
+
+```powershell
+powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File test/win32/test_shell_integration.ps1
+pwsh.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File test/win32/test_shell_integration.ps1
+```
+
+Windows CI runs it under both Windows PowerShell 5.1 and PowerShell 7.
+
+### Global-input tests: isolated desktop only
+
+The full GUI suite and the tab, split, and IME scripts inject desktop-global
+input. They refuse to run unless `GHOSTTY_TEST_ISOLATED_DESKTOP=1` is explicitly
+set for a dedicated, isolated desktop. Never enable this on the desktop where
+you are working: Windows focus requests can fail or race. From WSL, the flag
+must be set in its environment and listed in `WSLENV` so Windows children also
+receive it.
+
+Only on that isolated desktop:
 
 ```bash
 bash test/win32/ghostty_test.sh all
 ```
 
-Keyboard/mouse injection tests must run on a dedicated desktop. They are
-disabled unless `GHOSTTY_TEST_ISOLATED_DESKTOP=1` is explicitly set in Windows
-(propagate it through `WSLENV` when launching from WSL). Never enable this on
-the desktop where you are working: Windows focus requests can fail or race.
-The program-resize test uses a controlled child process instead of desktop input.
+The standalone tab and split scripts have the same guard. Run from Windows
+PowerShell with an app executable on a local Windows path:
 
-25+ automated tests cover: launch/close, window properties, keyboard input, multiple windows, clipboard, config loading, scrollbar, close confirmation, URL detection, notifications, window sizing, window resize (real assertion), search bar, config reload, tabs (new/switch/close), opacity, command palette, tab drag reorder, inline tab rename, split panes, font zoom, fullscreen toggle, open config, and quick terminal.
-
-Tab and split tests run in PowerShell sessions:
-
-```bash
+```powershell
 powershell.exe -ExecutionPolicy Bypass -File test/win32/test_tabs.ps1 -ExePath path\to\ghostty.exe
 powershell.exe -ExecutionPolicy Bypass -File test/win32/test_splits.ps1 -ExePath path\to\ghostty.exe
 ```
@@ -347,21 +457,44 @@ reporting controls, paste protection, and libghostty-vt API updates. Windows
 retains WGL/ConPTY; upstream's GTK EGL/DMABUF presentation path is Linux-specific.
 The toolchain and Windows CI now use Zig 0.17.0 (`-Doptimize=fast` for releases).
 
-To sync:
+Configure the `upstream` remote once if it is missing:
 
 ```bash
 git remote add upstream https://github.com/ghostty-org/ghostty.git
+```
+
+Start from an up-to-date, clean `main`, and merge on a review branch:
+
+```bash
 git fetch upstream
+git switch -c sync/upstream-YYYY-MM-DD main
 git merge upstream/main
 ```
 
-`git rerere` is enabled in the local repo so previously-resolved
-conflict resolutions get re-applied automatically on subsequent merges.
+Optionally enable reusable conflict resolutions in your checkout with
+`git config rerere.enabled true`. Always review reused resolutions too.
 
-When resolving conflicts, default to **keep upstream** for any file
-outside `src/apprt/win32/`, `dist/windows/`, or `test/win32/`. The
-`.win32` switch arms (`.none, .win32 => void` and similar) need to be
-preserved in upstream switches that handle apprt variants.
+Do not resolve shared files by blindly taking upstream. Windows-specific
+adaptations live outside `src/apprt/win32/`, `dist/windows/`, and `test/win32/`
+as well. Preserve and re-audit these contracts:
+
+- `.win32` switch arms, Windows config defaults, font discovery, and ConPTY
+  handle types in shared code.
+- WGL device selection and render-thread GPU resource ownership, context
+  recovery, and bounded shutdown in `src/renderer/` and `src/Surface.zig`.
+- Synchronous ConPTY resize outside the renderer-state lock in
+  `src/termio/Termio.zig`, plus PowerShell command construction and integration.
+- Windows-targeted C translations, system libraries, resources, GNU ABI,
+  and SEH unwind tables in stripped releases in `src/build/` and `build.zig`.
+- Deferred URL opening outside core locks, untrusted-target checks, and
+  shutdown cleanup of queued requests.
+- Fork CI/toolchain pins, shared-desktop input guards, and packaging layout.
+  Do not reactivate upstream publishing workflows as a merge side effect.
+
+Before merging, run targeted native tests, both debug and stripped release
+builds, the no-input integration checks, and formatting checks. Use an isolated
+desktop for any global-input suite; compilation alone does not establish UI
+feature parity.
 
 Files most likely to conflict on upstream merges:
 - `src/Surface.zig`, `src/config/Config.zig`, `src/font/discovery.zig`,
@@ -369,6 +502,10 @@ Files most likely to conflict on upstream merges:
 - Switch-arm files: `src/apprt/runtime.zig`, `src/apprt.zig`,
   `src/datastruct/split_tree.zig`, `src/input/Binding.zig`,
   `src/font/face.zig`, `src/terminal/mouse.zig`
+- Renderer and build files: `src/renderer/OpenGL.zig`, `src/renderer/Thread.zig`,
+  `src/renderer/generic.zig`, `src/termio/Termio.zig`, `src/termio/Exec.zig`,
+  `src/termio/shell_integration.zig`, `src/build/GhosttyExe.zig`,
+  `src/build/SharedDeps.zig`, and `.github/workflows/windows-ci.yml`
 
 ## License
 

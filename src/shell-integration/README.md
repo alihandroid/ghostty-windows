@@ -94,6 +94,37 @@ source /Applications/Ghostty.app/Contents/Resources/ghostty/shell-integration/nu
 use ghostty *
 ```
 
+### PowerShell
+
+The Windows runtime detects Windows PowerShell 5.1 (`powershell.exe`) and
+PowerShell 7 (`pwsh.exe`). When shell integration is enabled, it adds
+`-NoExit -Command` arguments to dot-source
+`shell-integration/powershell/ghostty-shell-integration.ps1` from the discovered
+resources directory. No profile edit is needed. In a portable package this
+directory is `share/ghostty/` beside `ghostty.exe`, not the configuration
+directory under `%LOCALAPPDATA%`.
+
+The script wraps the existing `prompt` function and preserves its text and
+`LASTEXITCODE`. It emits semantic prompt markers (OSC 133) and the working
+directory (OSC 7). Cursor shape and title updates are controlled by
+`GHOSTTY_SHELL_FEATURES`, which Ghostty sets from its shell-integration options.
+If PSReadLine is loaded when the script starts, an Enter handler also emits
+the command-start marker before accepting the line. The script does nothing
+when `GHOSTTY_SHELL_FEATURES` is absent; sourcing it in unrelated shells is
+not a substitute for Ghostty's integration setup.
+
+Construct ESC with `[char]27`: Windows PowerShell 5.1 treats a backtick-e as
+literal `e`, unlike PowerShell 7. Test the actual emitted control bytes under
+both engines from the repository root:
+
+```powershell
+powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File test/win32/test_shell_integration.ps1
+pwsh.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File test/win32/test_shell_integration.ps1
+```
+
+The regression test captures output in memory and intercepts PSReadLine handler
+registration. It does not launch a GUI, accept a console line, or inject input.
+
 ### Zsh
 
 Automatic [Zsh](https://www.zsh.org/) integration works by temporarily setting

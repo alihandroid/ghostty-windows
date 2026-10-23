@@ -8,7 +8,7 @@ to encode key events into terminal escape sequences.
 First, build the WebAssembly module:
 
 ```bash
-zig build -Demit-lib-vt -Dtarget=wasm32-freestanding -Doptimize=ReleaseSmall
+zig build -Demit-lib-vt -Dtarget=wasm32-freestanding -Doptimize=small
 ```
 
 This will create `zig-out/bin/ghostty-vt.wasm`.

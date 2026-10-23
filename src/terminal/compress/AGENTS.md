@@ -25,7 +25,7 @@ When making tradeoffs, in order:
   this code ships in libghostty-vt.
 - Codecs must keep building for `wasm32-freestanding` (libghostty-vt):
   no libc, no `src/simd` (Highway) dependencies. Verify with
-  `zig build -Demit-lib-vt -Dtarget=wasm32-freestanding -Doptimize=ReleaseSmall`.
+  `zig build -Demit-lib-vt -Dtarget=wasm32-freestanding -Doptimize=small`.
 - Every codec needs a differential property suite: round-trip identity,
   an independent format walker, wrong-size output rejection, and
   corruption/truncation decoding. Keep a light version in normal unit
@@ -49,16 +49,16 @@ When making tradeoffs, in order:
 - Use `ghostty-bench +page-compression` (see `src/benchmark/AGENTS.md`
   for the general workflow). Modes: `compress`, `decompress`, `store`,
   and `report` for ratio.
-- Build: `zig build -Demit-bench -Doptimize=ReleaseFast -Demit-macos-app=false`
+- Build: `zig build -Demit-bench -Doptimize=fast -Demit-macos-app=false`
 - The most representative corpus is a raw dump of real page backing
-  memory, chunked at the page size (400 KiB on ReleaseFast targets).
+  memory, chunked at the page size (400 KiB on `fast` targets).
   Supplement with a text corpus and random bytes for worst cases, but
   weigh page corpora highest per the priorities above. Keep corpora
   outside the repository and reuse identical files across comparisons.
 - `ghostty-bench +scrollback-compression` measures the PageList
   transitions around the codec rather than the codec itself.
 - For fast iteration, keep codecs dependent only on `std` so a standalone
-  harness can build them directly with `zig build-exe -O ReleaseFast` and
+  harness can build them directly with `zig build-exe -O fast` and
   time the codec in-process (report min-of-N, verify round-trips).
 - Measure one change at a time and re-measure the final state; run-to-run
   noise is a few percent, so re-run before believing small deltas.

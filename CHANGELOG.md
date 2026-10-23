@@ -5,11 +5,25 @@ the underlying upstream commit when known.
 
 ## Unreleased
 
+### Upstream
+
 - Sync 733 upstream commits through `f54340ad7` (2026-10-21), including terminal,
   Kitty graphics/render-state, snapshot, paste-protection, and libghostty-vt updates.
-- Require Zig 0.17.0 for Windows builds, CI, and packaging (`-Doptimize=fast`).
+- Add opt-in program-requested resizing (CSI 8 t), DECSTR soft reset,
+  screen-size and DEC/xterm checksum reporting, and additional keyboard encodings.
+- Preserve Kitty images, placements, and pixel data in snapshots; expand
+  graphics render-state, animation, and libghostty-vt APIs, including `vt_write_until`.
+- Fix wide-character selection/resize behavior, scrollback pruning and search,
+  and initialization cleanup. Treat carriage returns as unsafe paste content
+  and harden image file loading and memory limits.
+- Migrate the shared code to Zig 0.17.0 and update Unicode data to version 18.
+
+### Windows Fixes and Adaptations
+
+- Migrate Windows-specific code, CI, and packaging to Zig 0.17.0
+  (`-Doptimize=fast` for releases).
 - Retain Windows SEH unwind metadata in stripped releases so MinGW's runtime
-  remains buildable; verify both debug and release builds in CI.
+  remains buildable.
 - Adapt Windows WGL to upstream's shared-device and render-thread resource
   lifecycle while retaining bounded shutdown and GPU-context recovery.
 - Avoid holding the terminal lock while synchronously resizing ConPTY, which
@@ -17,10 +31,26 @@ the underlying upstream commit when known.
 - Support opt-in CSI 8 t window resizing with DPI scaling, zero-dimension
   preservation, monitor limits, and fullscreen/tab/split guards.
 - Validate untrusted terminal links before dispatch: allow HTTP(S)/mailto,
-  confirm custom schemes, and block untrusted paths/file URLs. Preserve deferred
-  opening and queued-request cleanup from the URL deadlock fix.
+  confirm custom schemes, and block untrusted paths/file URLs.
+- Fix URL-opening freezes by deferring shell dispatch until the click handler
+  releases the renderer lock; free queued requests during shutdown (PR #12).
+- Honor `auto-update=off` for startup checks while keeping explicit manual
+  checks available. Harden persisted timestamps against invalid, future, and
+  overflowing values without bypassing the automatic-check rate limit (PR #11).
+- Fix Windows PowerShell 5.1 integration emitting literal `e` instead of ESC
+  in prompt, title, working-directory, and cursor control sequences.
+
+### Testing and Development
+
+- Verify both debug and stripped release builds in Windows CI.
+- Add a no-input PowerShell integration regression test under Windows
+  PowerShell 5.1 and PowerShell 7, capturing actual VT output in memory.
+- Add `test-build` to compile Zig tests without executing a foreign-target
+  runner; document local Windows test staging with reference fixtures.
 - Disable global-input integration tests on shared desktops by default; the
-  program-resize test uses an isolated child/file handshake without keyboard input.
+  program-resize test uses a controlled child/file handshake without keyboard input.
+- Refresh configuration paths, shortcuts, portable integration instructions,
+  Zig optimization names, and the shared-code upstream-merge checklist.
 
 ## win-v1.3.0 — 2026-09-01
 

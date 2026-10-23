@@ -86,8 +86,12 @@ KEYBOARD SHORTCUTS
   Ctrl+,              Open config file
 
 SHELL INTEGRATION (PowerShell)
-  Add to your PowerShell profile:
-    . "\$env:LOCALAPPDATA\\ghostty\\share\\ghostty\\shell-integration\\powershell\\ghostty-shell-integration.ps1"
+  Windows PowerShell 5.1 (powershell.exe) and PowerShell 7 (pwsh.exe)
+  load the bundled integration automatically when enabled.
+  No PowerShell profile edit is required. Keep the share/ folder beside
+  ghostty.exe wherever you extract this portable package.
+  The script is share/ghostty/shell-integration/powershell/ghostty-shell-integration.ps1.
+  To disable integration, set shell-integration = none in your config.
 
 For full documentation: https://ghostty.org/docs
 READMEEOF

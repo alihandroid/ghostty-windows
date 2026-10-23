@@ -31,9 +31,9 @@ The benchmark tools are split into two roles:
 
 ## Building
 
-- Build benchmark tools with `zig build -Demit-bench -Doptimize=ReleaseFast`.
+- Build benchmark tools with `zig build -Demit-bench -Doptimize=fast`.
 - On macOS, add `-Demit-macos-app=false` to avoid building the macOS app.
-- Make sure you specify `-Doptimize=ReleaseFast` when building benchmarks,
+- Make sure you specify `-Doptimize=fast` when building benchmarks,
   otherwise the debug build will be very slow and not representative of real
   performance.
 
