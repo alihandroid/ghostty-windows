@@ -818,6 +818,18 @@ pub extern "kernel32" fn GlobalFree(
 pub const WM_COMMAND: u32 = 0x0111;
 pub const WM_CTLCOLOREDIT: u32 = 0x0133;
 pub const WM_CTLCOLORSTATIC: u32 = 0x0138;
+pub const WM_CTLCOLORLISTBOX: u32 = 0x0134;
+
+// Native dialog navigation and Unicode tab-title filtering.
+pub extern "user32" fn IsDialogMessageW(hDlg: HWND, lpMsg: *MSG) callconv(.winapi) i32;
+pub extern "user32" fn EnableWindow(hWnd: HWND, bEnable: i32) callconv(.winapi) i32;
+pub extern "kernel32" fn CompareStringOrdinal(
+    lpString1: [*]const u16,
+    cchCount1: i32,
+    lpString2: [*]const u16,
+    cchCount2: i32,
+    bIgnoreCase: i32,
+) callconv(.winapi) i32;
 // STATIC control styles.
 pub const SS_CENTER: u32 = 0x0001;
 pub const SS_RIGHT: u32 = 0x0002;

@@ -9,6 +9,7 @@ const apprt = @import("../../apprt.zig");
 
 const App = @import("App.zig");
 const Surface = @import("Surface.zig");
+const TabOverview = @import("TabOverview.zig");
 const SplitTree = @import("../../datastruct/split_tree.zig").SplitTree;
 const w32 = @import("win32.zig");
 
@@ -16,6 +17,8 @@ const log = std.log.scoped(.win32);
 
 /// Maximum number of tabs per window.
 const MAX_TABS: usize = 64;
+const WM_TOGGLE_TAB_OVERVIEW = w32.WM_APP + 5;
+const WM_REFRESH_TAB_OVERVIEW = w32.WM_APP + 6;
 
 /// The parent App.
 app: *App,
@@ -25,6 +28,8 @@ hwnd: ?w32.HWND = null,
 
 /// Tab split trees owned by this window (fixed-capacity inline array).
 tab_count: usize = 0,
+tab_overview: TabOverview = .{},
+overview_refresh_pending: bool = false,
 tab_trees: [64]SplitTree(Surface) = undefined,
 
 /// The currently focused surface within each tab.
@@ -138,7 +143,7 @@ pub const InitOptions = struct {
 /// Read HKCU\...\Themes\Personalize\AppsUseLightTheme. Returns true when the
 /// system apps theme is light. A missing/erroring value is treated as light,
 /// which is how the Personalize key reads before it is ever written.
-fn systemUsesLightTheme() bool {
+pub fn systemUsesLightTheme() bool {
     const subkey = std.unicode.utf8ToUtf16LeStringLiteral(
         "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
     );
@@ -224,6 +229,7 @@ pub fn onConfigChange(self: *Window) void {
         applyChromeTheme(hwnd, self.app.config.@"window-theme", self.app.config.background);
         applyBackgroundBlur(hwnd, self.app.config.@"background-blur".enabled());
     }
+    self.tab_overview.updateAppearance();
 }
 
 /// Initialize the Window by creating the top-level HWND and tab bar font.
@@ -364,6 +370,7 @@ pub fn init(self: *Window, app: *App, options: InitOptions) !void {
 
 /// Deinitialize the Window: close all tabs, delete font, destroy HWND.
 pub fn deinit(self: *Window) void {
+    self.tab_overview.deinit();
     // Close all tab surfaces.
     self.cleanupAllSurfaces();
 
@@ -498,7 +505,48 @@ pub fn addTabWithOptions(self: *Window, options: AddTabOptions) !*Surface {
         self.selectTabIndex(pos);
     }
     self.updateTabBarVisibility();
+    self.invalidateTabBar();
     return surface;
+}
+
+/// The core may hold the renderer lock during an action. Opening an owned
+/// window changes focus and re-enters core handlers, so defer to the loop.
+pub fn requestToggleTabOverview(self: *Window) bool {
+    if (self.closing or self.is_quick_terminal or self.tab_count == 0) return false;
+    return w32.PostMessageW(self.hwnd orelse return false, WM_TOGGLE_TAB_OVERVIEW, 0, 0) != 0;
+}
+
+/// Close every split in the selected tab, confirming once if any needs it.
+pub fn requestCloseOverviewTab(self: *Window, id: u64) void {
+    const index = TabOverview.findTab(self, id) orelse return;
+    var it = self.tab_trees[index].iterator();
+    var needs_confirmation = false;
+    while (it.next()) |entry| {
+        if (entry.view.core_surface_ready and entry.view.core_surface.needsConfirmQuit()) {
+            needs_confirmation = true;
+            break;
+        }
+    }
+    if (!needs_confirmation) {
+        self.closeTabByIndex(index);
+        return;
+    }
+
+    const core_app = self.app.core_app;
+    const owner_hwnd = self.hwnd;
+    const result = w32.MessageBoxW(
+        owner_hwnd,
+        std.unicode.utf8ToUtf16LeStringLiteral("Processes are still running in this tab.\nClose the tab and all its splits?"),
+        std.unicode.utf8ToUtf16LeStringLiteral("Ghostty"),
+        w32.MB_OKCANCEL | w32.MB_ICONWARNING | w32.MB_DEFBUTTON2,
+    );
+    if (result != w32.IDOK) return;
+    // The modal loop may have processed child exits or destroyed this
+    // window. Resolve identity again; never dereference the old self.
+    const surface = core_app.findSurfaceByID(id) orelse return;
+    const owner = surface.rt_surface.parent_window;
+    if (owner.closing or owner.hwnd != owner_hwnd) return;
+    owner.closeTabByIndex(TabOverview.findTab(owner, id) orelse return);
 }
 
 /// Close a tab by surface pointer. Removes from the tab list,
@@ -525,6 +573,7 @@ fn closeTabByIndex(self: *Window, idx: usize) void {
     self.tab_count -= 1;
     if (self.tab_count == 0) {
         self.closing = true;
+        self.tab_overview.hide(false);
         if (self.hwnd) |hwnd| _ = w32.PostMessageW(hwnd, w32.WM_CLOSE, 0, 0);
         return;
     }
@@ -612,7 +661,10 @@ pub fn closeSplitSurface(self: *Window, surface: *Surface) void {
         log.debug("closeSplitSurface: focusing next surface", .{});
         self.tab_active_surface[tab] = ns;
         self.layoutSplits();
-        if (ns.hwnd) |h| _ = w32.SetFocus(h);
+        if (!self.tab_overview.active) {
+            if (ns.hwnd) |h| _ = w32.SetFocus(h);
+        }
+        self.invalidateTabBar();
     } else {
         log.debug("closeSplitSurface: no next surface, closing tab", .{});
         self.closeTabByIndex(tab);
@@ -648,8 +700,13 @@ pub fn selectTabIndex(self: *Window, idx: usize) void {
     self.active_tab = idx;
     const surface = self.tab_active_surface[idx];
     self.layoutSplits();
-    if (surface.hwnd) |h| _ = w32.SetFocus(h);
+    // An inactive child can exit while the user is searching. Keep focus
+    // in the overview; explicit activation hides it before selecting.
+    if (!self.tab_overview.active) {
+        if (surface.hwnd) |h| _ = w32.SetFocus(h);
+    }
     self.updateWindowTitle();
+    self.invalidateTabBar();
 }
 
 /// Layout split panes for the active tab.
@@ -1187,6 +1244,9 @@ fn updateTabBarVisibility(self: *Window) void {
 /// Invalidate the tab bar region so it gets repainted.
 pub fn invalidateTabBar(self: *Window) void {
     const hwnd = self.hwnd orelse return;
+    if (self.tab_overview.active and !self.overview_refresh_pending) {
+        self.overview_refresh_pending = w32.PostMessageW(hwnd, WM_REFRESH_TAB_OVERVIEW, 0, 0) != 0;
+    }
     var rect = w32.RECT{
         .left = 0,
         .top = 0,
@@ -2117,6 +2177,7 @@ pub fn confirmCloseIfNeeded(self: *Window) bool {
 /// because Win32 destroys child HWNDs during DestroyWindow and the
 /// OpenGL driver crashes if contexts are still active on destroyed windows.
 pub fn close(self: *Window) void {
+    self.tab_overview.deinit();
     // First, cleanly shut down all surfaces (renderer/IO threads, WGL, DC).
     self.cleanupAllSurfaces();
 
@@ -2144,6 +2205,7 @@ fn cleanupAllSurfaces(self: *Window) void {
 /// Surfaces are already cleaned up by close() before DestroyWindow.
 fn onDestroy(self: *Window) void {
     const app = self.app;
+    self.tab_overview.deinit();
 
     // Quick terminal windows are managed by QuickTerminal, not the windows list.
     if (self.is_quick_terminal) {
@@ -2224,6 +2286,17 @@ pub fn windowWndProc(
     };
 
     switch (msg) {
+        WM_TOGGLE_TAB_OVERVIEW => {
+            window.tab_overview.toggle(window) catch |err| {
+                log.warn("unable to open tab overview err={}", .{err});
+            };
+            return 0;
+        },
+        WM_REFRESH_TAB_OVERVIEW => {
+            window.overview_refresh_pending = false;
+            window.tab_overview.refresh();
+            return 0;
+        },
         w32.WM_GETOBJECT => {
             // Opt out of MSAA accessibility for OBJID_CLIENT on the
             // top-level window too. See the matching handler in

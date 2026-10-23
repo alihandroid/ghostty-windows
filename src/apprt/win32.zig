@@ -9,6 +9,7 @@ test {
     _ = App;
     _ = Surface;
     _ = @import("win32/Window.zig");
+    _ = @import("win32/TabOverview.zig");
 }
 
 const internal_os = @import("../os/main.zig");

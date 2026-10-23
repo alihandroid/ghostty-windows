@@ -20,6 +20,13 @@ the underlying upstream commit when known.
 
 ### Windows Fixes and Adaptations
 
+- Add a native searchable tab overview through `toggle_tab_overview` and the
+  command palette, with Unicode filtering, keyboard switching, DPI scaling,
+  and whole-tab closing that confirms running processes across all splits.
+- Validate popup parent classes before reading Surface userdata, preventing
+  terminal keyboard events from interpreting a Window pointer as a Surface.
+- Signal and close Windows reader quit pipes with native handle APIs, avoiding
+  stalled session shutdown and the resulting final-window cleanup failure.
 - Migrate Windows-specific code, CI, and packaging to Zig 0.17.0
   (`-Doptimize=fast` for releases).
 - Retain Windows SEH unwind metadata in stripped releases so MinGW's runtime
@@ -42,6 +49,10 @@ the underlying upstream commit when known.
 
 ### Testing and Development
 
+- Add the phased Windows feature roadmap with explicit completion criteria
+  and security gates for file links and protected input.
+- Add native tab-overview tests and an end-to-end test limited to validated,
+  test-owned HWNDs; no desktop-global input is needed.
 - Verify both debug and stripped release builds in Windows CI.
 - Add a no-input PowerShell integration regression test under Windows
   PowerShell 5.1 and PowerShell 7, capturing actual VT output in memory.

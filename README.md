@@ -51,6 +51,7 @@ macOS/GTK feature parity.
 - Multiple windows, tabbed interface with custom GDI tab bar
 - Tab drag-and-drop reorder, inline rename (double-click), right-click context menu
 - Close tab modes: current, all others, all to the right
+- Searchable native tab overview with keyboard switching and whole-tab closing
 
 **Split Panes**
 - Split right/down/left/up, navigate between panes
@@ -107,10 +108,11 @@ macOS/GTK feature parity.
 
 ### Platform-Specific Notes
 
+- Planned Windows work and completion criteria are tracked in the [roadmap](ROADMAP.md).
 - Inspector (debug overlay) — acknowledged but no Win32 UI yet
-- `undo`/`redo` — macOS NSUndoManager only, no Win32 equivalent
+- `undo`/`redo` — not implemented on Windows; a custom bounded undo stack is planned
 - `secure_input` — macOS EnableSecureEventInput only
-- Tab overview — no native overview UI yet
+- Tab overview uses a searchable title list; live thumbnails are not implemented
 - Portable release ZIP is supported; MSI/MSIX installers are not implemented
 - Terminal-supplied HTTP(S)/mailto links open directly; custom protocols require
   confirmation. Untrusted paths and `file:` URLs are blocked until Windows has
@@ -223,6 +225,13 @@ All keybindings are configurable via the `keybind` config option. These are the 
 | Drag reorder | Mouse drag on tab |
 | Rename tab | Double-click tab |
 | Tab context menu | Right-click tab |
+
+Open **Tab Overview** from the command palette, or bind the
+`toggle_tab_overview` action to a key. Type to filter titles, use Up/Down to
+select, Enter to switch, and Escape to dismiss. Tab moves focus between the
+search field, list, and buttons. **Close tab** closes every split in the
+selected tab, with one confirmation if any split requires it. The overview
+shows tabs in the current normal window, not the quick terminal.
 
 ### Split Panes
 
@@ -371,7 +380,8 @@ From WSL, compile without executing the Windows test runner:
 zig build test-build -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu -Demit-test-exe=true
 ```
 
-Add `-Dtest-filter="program resize"` to compile a focused test executable.
+Add `-Dtest-filter="program resize"` or `-Dtest-filter="tab overview"` to compile
+a focused test executable.
 The installed test binary is `zig-out/bin/ghostty-test.exe`.
 
 To run that binary from a WSL checkout, open PowerShell at the repository root
@@ -404,15 +414,19 @@ inspection.
 
 ### Tests without desktop input
 
-After building the app, the WSL harness can run a controlled-child resize test:
+After building the app, the WSL harness can run these focused GUI tests:
 
 ```bash
 bash test/win32/ghostty_test.sh program_window_resize
+bash test/win32/ghostty_test.sh tab_overview
 ```
 
-It uses a file handshake and owned window handles, not keyboard/mouse injection.
-The harness stages the app under Windows `%TEMP%`. The `resize` and
-`window_properties` cases also avoid global input.
+The resize test uses a file handshake. The overview test sends messages only
+to window handles validated against its own process; it covers Unicode
+filtering, switching, close confirmation, split-tab closing, and child exits.
+Neither uses desktop-global keyboard/mouse injection. The harness stages the
+app under Windows `%TEMP%`. The `resize` and `window_properties` cases also
+avoid global input.
 
 The PowerShell integration regression test captures VT output in memory and
 needs neither a GUI nor the app binary. Run from the repository root in Windows:

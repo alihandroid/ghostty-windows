@@ -15,6 +15,7 @@ const global = @import("../../global.zig");
 const QuickTerminal = @import("QuickTerminal.zig");
 const Surface = @import("Surface.zig");
 const Window = @import("Window.zig");
+const TabOverview = @import("TabOverview.zig");
 const SplitTree = @import("../../datastruct/split_tree.zig").SplitTree;
 const w32 = @import("win32.zig");
 const UntrustedUrl = @import("UntrustedUrl.zig");
@@ -78,6 +79,7 @@ hinstance: w32.HINSTANCE,
 /// Window class atoms from RegisterClassExW.
 class_atom: u16 = 0,
 terminal_class_atom: u16 = 0,
+overview_class_atom: u16 = 0,
 msg_class_atom: u16 = 0,
 
 /// List of active Window containers (tabbed windows).
@@ -205,6 +207,9 @@ pub fn init(
         _ = w32.UnregisterClassW(TERMINAL_CLASS_NAME, self.hinstance);
     };
 
+    self.overview_class_atom = try TabOverview.registerClass(hinstance);
+    errdefer _ = w32.UnregisterClassW(TabOverview.class_name, hinstance);
+
     // Register the message-only window class (WM_APP_WAKEUP, WM_TIMER).
     const mc = w32.WNDCLASSEXW{
         .cbSize = @sizeOf(w32.WNDCLASSEXW),
@@ -298,6 +303,33 @@ pub fn run(self: *App) !void {
             continue;
         }
 
+        // Overview controls belong to TabOverview, not Surface. Route them
+        // before the legacy popup code interprets the parent's userdata.
+        // Include hidden controls so queued keys cannot reach that cast.
+        if (msg.hwnd) |hwnd| {
+            for (self.windows.items) |win| {
+                if (!win.tab_overview.ownsInput(hwnd)) continue;
+                if (msg.message == w32.WM_KEYDOWN) {
+                    if (!win.tab_overview.active) continue :loop;
+                    const vk: u16 = @truncate(msg.wParam);
+                    if (win.tab_overview.handleKey(hwnd, vk)) continue :loop;
+                    const ctrl = w32.GetKeyState(@as(i32, w32.VK_CONTROL)) < 0;
+                    const shift = w32.GetKeyState(@as(i32, w32.VK_SHIFT)) < 0;
+                    if (ctrl and (shift or !isEditShortcutVk(vk))) {
+                        win.tab_overview.hide(true);
+                        if (win.getActiveSurface()) |surface|
+                            surface.handleKeyEvent(msg.wParam, msg.lParam, .press);
+                        continue :loop;
+                    }
+                }
+                if (w32.IsDialogMessageW(win.tab_overview.hwnd.?, &msg) == 0) {
+                    _ = w32.TranslateMessage(&msg);
+                    _ = w32.DispatchMessageW(&msg);
+                }
+                continue :loop;
+            }
+        }
+
         // Intercept keystrokes destined for popup edit controls so
         // Enter/Escape/Arrow keys can be handled by our code.
         if (msg.message == w32.WM_KEYDOWN and msg.hwnd != null) {
@@ -318,17 +350,12 @@ pub fn run(self: *App) !void {
             }
 
             // Find the parent surface of this edit control
-            const parent = w32.GetParent(msg.hwnd.?);
-            if (parent) |p| {
-                const userdata = w32.GetWindowLongPtrW(p, w32.GWLP_USERDATA);
-                if (userdata != 0) {
-                    const surface: *Surface = @ptrFromInt(@as(usize, @bitCast(userdata)));
-                    if (surface.search_active and surface.search_edit == msg.hwnd) {
-                        if (surface.handleSearchKey(vk)) continue;
-                    }
-                    if (surface.palette_active and surface.palette_edit == msg.hwnd) {
-                        if (surface.handlePaletteKey(vk)) continue;
-                    }
+            if (self.popupSurface(msg.hwnd.?)) |surface| {
+                if (surface.search_active and surface.search_edit == msg.hwnd) {
+                    if (surface.handleSearchKey(vk)) continue;
+                }
+                if (surface.palette_active and surface.palette_edit == msg.hwnd) {
+                    if (surface.handlePaletteKey(vk)) continue;
                 }
             }
 
@@ -354,10 +381,7 @@ pub fn run(self: *App) !void {
                         }
                     }
                     // Palette/search edits are children of a surface HWND.
-                    const pp = w32.GetParent(msg.hwnd.?) orelse break :blk null;
-                    const ud = w32.GetWindowLongPtrW(pp, w32.GWLP_USERDATA);
-                    if (ud == 0) break :blk null;
-                    const surface: *Surface = @ptrFromInt(@as(usize, @bitCast(ud)));
+                    const surface = self.popupSurface(msg.hwnd.?) orelse break :blk null;
                     if (surface.palette_active and surface.palette_edit == msg.hwnd) {
                         surface.setCommandPaletteActive(false);
                         break :blk surface;
@@ -451,6 +475,10 @@ pub fn terminate(self: *App) void {
     if (self.terminal_class_atom != 0) {
         _ = w32.UnregisterClassW(TERMINAL_CLASS_NAME, self.hinstance);
         self.terminal_class_atom = 0;
+    }
+    if (self.overview_class_atom != 0) {
+        _ = w32.UnregisterClassW(TabOverview.class_name, self.hinstance);
+        self.overview_class_atom = 0;
     }
     if (self.class_atom != 0) {
         _ = w32.UnregisterClassW(WINDOW_CLASS_NAME, self.hinstance);
@@ -838,7 +866,10 @@ pub fn performAction(
         },
 
         .toggle_tab_overview => {
-            return true;
+            return switch (target) {
+                .app => false,
+                .surface => |surface| surface.rt_surface.parent_window.requestToggleTabOverview(),
+            };
         },
 
         .initial_size => {
@@ -1579,6 +1610,19 @@ fn isEditShortcutVk(vk: u16) bool {
         'A', 'C', 'V', 'X', 'Y', 'Z' => true,
         else => false,
     };
+}
+
+/// Only surface-class parents store Surface userdata. A terminal child has
+/// a Window parent; interpreting that pointer as Surface is invalid even
+/// when we only intended to check whether a popup edit is active.
+fn popupSurface(self: *const App, child: w32.HWND) ?*Surface {
+    const parent = w32.GetParent(child) orelse return null;
+    if (self.terminal_class_atom == 0 or
+        @as(u16, @truncate(w32.GetClassLongW(parent, w32.GCW_ATOM))) != self.terminal_class_atom)
+        return null;
+    const userdata = w32.GetWindowLongPtrW(parent, w32.GWLP_USERDATA);
+    if (userdata == 0) return null;
+    return @ptrFromInt(@as(usize, @bitCast(userdata)));
 }
 
 /// Register a system-wide hotkey for toggle_quick_terminal.
@@ -2635,6 +2679,39 @@ fn msgWndProc(
     }
 
     return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
+}
+
+test "tab overview popup routing rejects container userdata" {
+    const instance = w32.GetModuleHandleW(null) orelse return error.Win32Error;
+    const name = std.unicode.utf8ToUtf16LeStringLiteral("GhosttyPopupRoutingTest");
+    const atom = w32.RegisterClassExW(&.{
+        .cbSize = @sizeOf(w32.WNDCLASSEXW),
+        .style = 0,
+        .lpfnWndProc = &w32.DefWindowProcW,
+        .cbClsExtra = 0,
+        .cbWndExtra = 0,
+        .hInstance = instance,
+        .hIcon = null,
+        .hCursor = null,
+        .hbrBackground = null,
+        .lpszMenuName = null,
+        .lpszClassName = name,
+        .hIconSm = null,
+    });
+    if (atom == 0) return error.Win32Error;
+    defer _ = w32.UnregisterClassW(name, instance);
+    const empty = std.unicode.utf8ToUtf16LeStringLiteral("");
+    const container = w32.CreateWindowExW(0, std.unicode.utf8ToUtf16LeStringLiteral("STATIC"), empty, 0, 0, 0, 1, 1, null, null, instance, null) orelse return error.Win32Error;
+    defer _ = w32.DestroyWindow(container);
+    const terminal = w32.CreateWindowExW(0, name, empty, w32.WS_CHILD, 0, 0, 1, 1, container, null, instance, null) orelse return error.Win32Error;
+    var app: App = .{ .core_app = undefined, .config = undefined, .hinstance = instance, .terminal_class_atom = atom };
+    // A non-Surface sentinel must never be dereferenced during routing.
+    _ = w32.SetWindowLongPtrW(container, w32.GWLP_USERDATA, 1);
+    try std.testing.expectEqual(@as(?*Surface, null), app.popupSurface(terminal));
+    const edit = w32.CreateWindowExW(0, std.unicode.utf8ToUtf16LeStringLiteral("EDIT"), empty, w32.WS_CHILD, 0, 0, 1, 1, terminal, null, instance, null) orelse return error.Win32Error;
+    var surface: Surface = .{ .app = &app };
+    _ = w32.SetWindowLongPtrW(terminal, w32.GWLP_USERDATA, @bitCast(@intFromPtr(&surface)));
+    try std.testing.expectEqual(@as(?*Surface, &surface), app.popupSurface(edit));
 }
 
 test "export terminal IO requires a surface target" {

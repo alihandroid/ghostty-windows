@@ -1404,6 +1404,7 @@ pub const PALETTE_ITEM_HEIGHT: f32 = 28.0;
 const palette_entries = [_]PaletteEntry{
     .{ .name = "New Window", .action = .new_window },
     .{ .name = "New Tab", .action = .new_tab },
+    .{ .name = "Tab Overview", .action = .toggle_tab_overview },
     .{ .name = "Close Surface", .action = .close_surface },
     .{ .name = "Close Tab", .action = .{ .close_tab = .this } },
     .{ .name = "Close Window", .action = .close_window },
