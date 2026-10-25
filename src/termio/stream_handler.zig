@@ -505,7 +505,7 @@ pub const StreamHandler = struct {
     }
 
     pub fn apcEnd(self: *StreamHandler) !void {
-        var result = self.apc.end() orelse return;
+        var result = self.apc.endRequest() orelse return;
         defer result.deinit(self.alloc);
 
         // log.warn("APC command: {}", .{result});
@@ -1073,6 +1073,8 @@ pub const StreamHandler = struct {
         v: terminal.osc.Command.KittyClipboardProtocol,
     ) error{ OutOfMemory, WriteFailed }!void {
         const kitty_clipboard = terminal.kitty.clipboard;
+
+        if (kitty_clipboard.Metadata.isResponse(v.metadata)) return;
 
         // Decode and validate the metadata. Malformed structure drops
         // the packet without a response. Invalid decoded text on a write

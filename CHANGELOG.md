@@ -20,6 +20,23 @@ the underlying upstream commit when known.
 
 ### Windows Fixes and Adaptations
 
+- Honor read-only mode for Win32 keyboard and IME input packets.
+- Preserve search, command-palette, and link-preview window ownership when
+  detaching tabs, and keep popup destruction from invalidating a live terminal.
+- Retain fractional movement during precision scrolling and honor disabled
+  mouse reporting when deciding whether links can be hovered.
+- Ignore echoed Glyph Protocol and Kitty clipboard status replies, preventing
+  reply loops, accidental glyph clearing, and clipboard transaction replacement.
+- Refresh link hover when Ctrl/Shift change, including Win32 input mode, so
+  releasing a link-opening shortcut restores the cursor and clears its preview.
+- Reset stale mouse tracking at the integrated zsh prompt after an SSH
+  disconnect or crashed application. Share shell integration metadata with WSL
+  and add a history-preserving **Reset Mouse Reporting** command for recovery.
+- Ignore echoed device-attribute and keyboard-protocol responses instead of
+  answering them repeatedly, preventing escape-sequence input loops when an
+  SSH disconnect leaves terminal echo enabled.
+- Bundle the pinned Microsoft ConPTY console host so Windows' older built-in
+  host cannot generate its own query/reply loop before Ghostty sees the data.
 - Add a native searchable tab overview through `toggle_tab_overview` and the
   command palette, with Unicode filtering, keyboard switching, DPI scaling,
   and whole-tab closing that confirms running processes across all splits.
@@ -49,6 +66,8 @@ the underlying upstream commit when known.
 
 ### Testing and Development
 
+- Add focused input and popup-lifetime regressions, and extend the bounded
+  reply-feedback test to glyph and clipboard replies without clipboard access.
 - Add the phased Windows feature roadmap with explicit completion criteria
   and security gates for file links and protected input.
 - Add native tab-overview tests and an end-to-end test limited to validated,

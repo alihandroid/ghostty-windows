@@ -1124,21 +1124,8 @@ pub fn moveTabToNewWindow(self: *Window, surface: *Surface) !bool {
     const destination_hwnd = destination.hwnd orelse return error.Win32Error;
     var moved_tree = self.tab_trees[tab_idx];
 
-    // Reparent every child HWND first so a failure can be rolled back before
-    // either window's tab arrays are mutated.
-    var it = moved_tree.iterator();
-    while (it.next()) |entry| {
-        const child = entry.view.hwnd orelse continue;
-        if (w32.SetParent(child, destination_hwnd) == null) {
-            if (self.hwnd) |source_hwnd| {
-                var rollback = moved_tree.iterator();
-                while (rollback.next()) |rollback_entry| {
-                    if (rollback_entry.view.hwnd) |h| _ = w32.SetParent(h, source_hwnd);
-                }
-            }
-            return error.Win32Error;
-        }
-    }
+    // Move child HWNDs and owned popups before mutating either tab array.
+    try reparentTabWindows(&moved_tree, self.hwnd.?, destination_hwnd);
 
     const moved_active = self.tab_active_surface[tab_idx];
     const moved_title = self.tab_titles[tab_idx];
@@ -1165,7 +1152,7 @@ pub fn moveTabToNewWindow(self: *Window, surface: *Surface) !bool {
     destination.tab_count = 1;
     destination.active_tab = 0;
 
-    it = destination.tab_trees[0].iterator();
+    var it = destination.tab_trees[0].iterator();
     while (it.next()) |entry| entry.view.parent_window = destination;
 
     self.selectTabIndex(self.active_tab);
@@ -1181,6 +1168,64 @@ pub fn moveTabToNewWindow(self: *Window, surface: *Surface) !bool {
 
     tracked = false;
     return true;
+}
+
+fn reparentTabWindows(tree: *const SplitTree(Surface), source: w32.HWND, destination: w32.HWND) !void {
+    var moved: usize = 0;
+    var it = tree.iterator();
+    while (it.next()) |entry| {
+        entry.view.reparentNativeWindows(destination) catch |err| {
+            var rollback = tree.iterator();
+            for (0..moved) |_| {
+                rollback.next().?.view.reparentNativeWindows(source) catch |rollback_err| {
+                    log.err("tab window transfer rollback failed: {}", .{rollback_err});
+                };
+            }
+            return err;
+        };
+        moved += 1;
+    }
+}
+
+test "detached tab rolls back child and popup transfers" {
+    const testing = std.testing;
+    const class = std.unicode.utf8ToUtf16LeStringLiteral("STATIC");
+    const empty = std.unicode.utf8ToUtf16LeStringLiteral("");
+    const source = w32.CreateWindowExW(0, class, empty, 0, 0, 0, 1, 1, null, null, null, null) orelse return error.Win32Error;
+    defer _ = w32.DestroyWindow(source);
+    const destination = w32.CreateWindowExW(0, class, empty, 0, 0, 0, 1, 1, null, null, null, null) orelse return error.Win32Error;
+    defer _ = w32.DestroyWindow(destination);
+
+    const first = try testing.allocator.create(Surface);
+    defer testing.allocator.destroy(first);
+    const second = try testing.allocator.create(Surface);
+    defer testing.allocator.destroy(second);
+    for ([_]*Surface{ first, second }) |surface| {
+        surface.* = .{ .app = undefined };
+        surface.hwnd = w32.CreateWindowExW(0, class, empty, w32.WS_CHILD, 0, 0, 1, 1, source, null, null, null) orelse return error.Win32Error;
+        surface.search_hwnd = w32.CreateWindowExW(0, class, empty, w32.WS_POPUP, 0, 0, 1, 1, source, null, null, null) orelse return error.Win32Error;
+    }
+    // Fail after moving the first complete surface and the second surface's
+    // child/search popup, exercising both levels of transaction rollback.
+    second.palette_hwnd = @ptrFromInt(1);
+    const nodes = [_]SplitTree(Surface).Node{
+        .{ .split = .{ .layout = .horizontal, .ratio = 0.5, .left = @fromBackingInt(1), .right = @fromBackingInt(2) } },
+        .{ .leaf = first },
+        .{ .leaf = second },
+    };
+    const tree: SplitTree(Surface) = .{ .arena = undefined, .nodes = &nodes, .zoomed = null };
+    try testing.expectError(error.Win32Error, reparentTabWindows(&tree, source, destination));
+    for ([_]*Surface{ first, second }) |surface| {
+        try testing.expectEqual(@as(?w32.HWND, source), w32.GetParent(surface.hwnd.?));
+        try testing.expectEqual(@as(isize, @bitCast(@intFromPtr(source))), w32.GetWindowLongPtrW(surface.search_hwnd.?, w32.GWLP_HWNDPARENT));
+    }
+
+    second.palette_hwnd = null;
+    try reparentTabWindows(&tree, source, destination);
+    for ([_]*Surface{ first, second }) |surface| {
+        try testing.expectEqual(@as(?w32.HWND, destination), w32.GetParent(surface.hwnd.?));
+        try testing.expectEqual(@as(isize, @bitCast(@intFromPtr(destination))), w32.GetWindowLongPtrW(surface.search_hwnd.?, w32.GWLP_HWNDPARENT));
+    }
 }
 
 /// Update the top-level window title to match the active tab's title.

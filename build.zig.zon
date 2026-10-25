@@ -9,6 +9,10 @@
         // only need to maintain one external dependency point)
         .translate_c = .{ .path = "./pkg/translate-c" },
 
+        // Windows console host redistributable. Its native helper fetches the
+        // pinned NuGet ZIP, whose .nupkg suffix Zig cannot unpack directly.
+        .conpty = .{ .path = "./pkg/conpty", .lazy = true },
+
         // Zig libs
         .libxev = .{
             // mitchellh/libxev

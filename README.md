@@ -38,7 +38,8 @@ macOS/GTK feature parity.
 **Terminal**
 - Shared upstream terminal emulation with OpenGL 4.3+ rendering (WGL)
 - FreeType + HarfBuzz fonts with DirectWrite system font discovery
-- ConPTY shell spawning (cmd.exe, PowerShell, WSL)
+- ConPTY shell spawning (cmd.exe, PowerShell, WSL) using the bundled Microsoft
+  console host to keep terminal protocol handling consistent across Windows versions
 - Win32 Input Mode (mode 9001) for full Unicode through ConPTY
 - IME support for CJK input (Japanese, Chinese, Korean) with the
   composition (preedit) rendered inline at the cursor and the candidate
@@ -168,6 +169,32 @@ build path. Cross-compiling is not the same as running the native tests: use
 `test-build` to compile them, then run from a local Windows directory with their
 fixtures as described under [Testing](#testing).
 
+### Keep the desktop development build current
+
+For local development from WSL, use this command after changing the code:
+
+```bash
+bash dist/windows/build-desktop.sh
+```
+
+It builds the current working tree in release mode and, only after a successful
+build, refreshes **Ghostty Dev** on the Windows desktop. Use that shortcut for
+development instead of manually copied executables. Set `ZIG=/path/to/zig` if
+Zig 0.17.0 is not on your `PATH` or under `~/.local/zig-versions`. Pass `debug`,
+`safe`, or `small` as the optional argument to select another optimization mode.
+
+The executable, console host, themes, and shell integration are installed together under
+`%LOCALAPPDATA%\ghostty-dev\builds`. Each distinct build gets its own directory,
+including resource-only changes. Previous builds stay available so existing
+terminal windows keep working; launch the shortcut again to use the new build.
+This follows local builds, without pulling remote changes or downloading releases.
+
+To publish an existing `zig-out` build from Windows PowerShell instead:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File dist/windows/install-dev.ps1
+```
+
 ### Release build
 
 ```bash
@@ -187,7 +214,10 @@ bash dist/windows/package.sh
 ```
 
 The ZIP is written to `dist/windows/ghostty-windows-x64-<version>.zip`.
-Extract it anywhere, keeping `ghostty.exe` beside the bundled `share/` tree.
+Extract it anywhere, keeping `ghostty.exe`, `conpty.dll`, and `OpenConsole.exe`
+together beside the bundled `share/` tree. The pinned Microsoft ConPTY backend
+is downloaded automatically when building the Windows app; its MIT license is
+included under `share/licenses/conpty/`.
 `share/terminfo/ghostty.terminfo` is the resource-directory sentinel; themes
 and automatic shell integration depend on that layout. Packaging does not
 install files under `%LOCALAPPDATA%`; that directory is used for configuration.
@@ -273,7 +303,7 @@ shows tabs in the current normal window, not the quick terminal.
 | Vertical scroll | Mouse wheel |
 | Horizontal scroll | Trackpad swipe / horizontal wheel |
 | Drag-select | Left-click drag |
-| Open URL | `Ctrl+Click` on a detected URL |
+| Open URL | `Ctrl+Click`; use `Ctrl+Shift+Click` when a TUI captures the mouse |
 | Middle-click paste | Middle button (configurable via `middle-click-action`) |
 | Drop file | Drag a file from Explorer onto the terminal — its path is pasted |
 
@@ -334,6 +364,23 @@ portable `share/` tree beside `ghostty.exe`; use `shell-integration = none`
 to disable integration. See the [implementation notes](src/shell-integration/README.md#powershell)
 for prompt markers, working-directory reporting, title, and cursor behavior.
 
+### WSL shell integration and mouse recovery
+
+The Windows app exports its terminal metadata and translated resource path
+through `WSLENV`. To enable integration in WSL zsh, add this to `~/.zshrc`:
+
+```zsh
+if [[ ${TERM_PROGRAM-} == ghostty && -n ${GHOSTTY_RESOURCES_DIR-} ]]; then
+  source "$GHOSTTY_RESOURCES_DIR/shell-integration/zsh/ghostty-integration"
+fi
+```
+
+The zsh prompt disables mouse tracking left behind by crashed programs or SSH
+disconnects. Running applications can still enable mouse support normally.
+For immediate recovery, open the command palette with `Ctrl+Shift+P` and select
+**Reset Mouse Reporting**, or bind the `reset_mouse_reporting` action. This
+preserves terminal contents and history.
+
 ## Architecture
 
 The Windows port adds a `win32` application runtime (`src/apprt/win32/`) alongside the existing GTK (Linux) and AppKit (macOS) runtimes. It reuses Ghostty's cross-platform core:
@@ -385,13 +432,17 @@ a focused test executable.
 The installed test binary is `zig-out/bin/ghostty-test.exe`.
 
 To run that binary from a WSL checkout, open PowerShell at the repository root
-and stage it with the reference fixtures in a fresh local Windows directory:
+and stage it with the reference fixtures in a fresh local Windows directory.
+Build the application first to populate the matching console runtime files:
 
 ```powershell
 $repo = (Get-Location).Path
 $testDir = Join-Path $env:TEMP ("ghostty-unit-" + [guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory -Path $testDir | Out-Null
 Copy-Item (Join-Path $repo 'zig-out\bin\ghostty-test.exe') (Join-Path $testDir 'ghostty-unit.exe')
+foreach ($runtime in @('conpty.dll', 'OpenConsole.exe')) {
+    Copy-Item (Join-Path $repo "zig-out\bin\$runtime") (Join-Path $testDir $runtime)
+}
 foreach ($fixture in @('src\terminal\snapshot\testdata', 'src\font\sprite\testdata', 'src\font\testdata')) {
     $destination = Join-Path $testDir $fixture
     New-Item -ItemType Directory -Path (Split-Path $destination) -Force | Out-Null
@@ -419,12 +470,20 @@ After building the app, the WSL harness can run these focused GUI tests:
 ```bash
 bash test/win32/ghostty_test.sh program_window_resize
 bash test/win32/ghostty_test.sh tab_overview
+bash test/win32/ghostty_test.sh reply_feedback
+bash test/win32/ghostty_test.sh mouse_reporting
 ```
 
 The resize test uses a file handshake. The overview test sends messages only
 to window handles validated against its own process; it covers Unicode
 filtering, switching, close confirmation, split-tab closing, and child exits.
-Neither uses desktop-global keyboard/mouse injection. The harness stages the
+The reply-feedback test uses a WSL Python 3 child to echo terminal responses,
+simulating an SSH disconnect without sleeping the desktop or using a server.
+It covers device attributes, keyboard flags, glyph support/coverage/clearing,
+and clipboard status replies; clipboard access is denied for the test.
+The mouse-reporting test uses WSL Python 3 and zsh to check reporting before a
+disconnect, prompt cleanup, and re-enabling reports for the next application.
+These tests use no desktop-global keyboard/mouse injection. The harness stages the
 app under Windows `%TEMP%`. The `resize` and `window_properties` cases also
 avoid global input.
 

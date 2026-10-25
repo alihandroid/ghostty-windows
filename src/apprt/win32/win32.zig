@@ -295,6 +295,7 @@ pub const FW_NORMAL: i32 = 400;
 pub const DEFAULT_CHARSET: u32 = 1;
 
 // Window long pointer indices
+pub const GWLP_HWNDPARENT: i32 = -8;
 pub const GWLP_USERDATA: i32 = -21;
 
 // HWND_MESSAGE for message-only windows

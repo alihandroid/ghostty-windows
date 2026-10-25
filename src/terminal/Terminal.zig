@@ -5066,6 +5066,32 @@ pub fn plainStringUnwrapped(self: *Terminal, alloc: Allocator) ![]const u8 {
     return try self.screens.active.dumpStringAllocUnwrapped(alloc, .{ .viewport = .{} });
 }
 
+/// Stop mouse tracking left behind by an application without changing the
+/// screen, scrollback, or unrelated input modes. A later application can
+/// enable tracking again with the usual DECSET sequences.
+pub fn resetMouseReporting(self: *Terminal) void {
+    const reset_modes = [_]modespkg.Mode{
+        .mouse_event_x10,
+        .mouse_event_normal,
+        .mouse_event_button,
+        .mouse_event_any,
+        .mouse_format_utf8,
+        .mouse_format_sgr,
+        .mouse_format_urxvt,
+        .mouse_format_sgr_pixels,
+    };
+    for (reset_modes) |mode| {
+        self.modes.set(mode, false);
+        // An unmatched restore from the disconnected application should not
+        // reactivate its saved mouse modes after the explicit recovery.
+        self.modes.save(mode);
+    }
+    self.flags.mouse_event = .none;
+    self.flags.mouse_format = .x10;
+    self.flags.mouse_shift_capture = .null;
+    self.mouse_shape = .text;
+}
+
 /// Full reset.
 ///
 /// This will attempt to free the existing screen memory but if that fails
@@ -16507,6 +16533,67 @@ test "Terminal: default xt checksum survives resets" {
     t.flags.xt_checksum = .{ .full = true };
     t.softReset();
     try testing.expectEqual(xt_checksum.Flags{ .no_trim = true }, t.flags.xt_checksum);
+}
+
+test "Terminal: resetMouseReporting preserves history and permits new tracking" {
+    var t = try init(testing.io, testing.allocator, .{ .cols = 30, .rows = 3 });
+    defer t.deinit(testing.allocator);
+    var s: Stream = .init(.{ .allocator = testing.allocator, .handler = .init(&t) });
+    defer s.deinit();
+
+    s.nextSlice("history\r\nfirst\r\nsecond\r\nshell prompt> ");
+    const before = try t.screens.active.dumpStringAlloc(testing.allocator, .{ .screen = .{} });
+    defer testing.allocator.free(before);
+    try testing.expect(std.mem.indexOf(u8, before, "history") != null);
+    try testing.expect(t.screens.active.pages.total_rows > t.rows);
+    const cursor_x = t.screens.active.cursor.x;
+    const cursor_y = t.screens.active.cursor.y;
+
+    // Simulate a disconnected application that left all tracking/format
+    // modes enabled, with SGR all-motion reporting selected last.
+    s.nextSlice("\x1b[?9;1000;1002;1003;1005;1006;1015;1016h\x1b[?1006h");
+    const reset_modes = [_]modespkg.Mode{
+        .mouse_event_x10,
+        .mouse_event_normal,
+        .mouse_event_button,
+        .mouse_event_any,
+        .mouse_format_utf8,
+        .mouse_format_sgr,
+        .mouse_format_urxvt,
+        .mouse_format_sgr_pixels,
+    };
+    for (reset_modes) |mode| {
+        try testing.expect(t.modes.get(mode));
+        t.modes.save(mode);
+    }
+    try testing.expectEqual(mouse.Event.any, t.flags.mouse_event);
+    try testing.expectEqual(mouse.Format.sgr, t.flags.mouse_format);
+    t.modes.set(.bracketed_paste, true);
+    t.modes.set(.win32_input, true);
+
+    t.resetMouseReporting();
+
+    for (reset_modes) |mode| {
+        try testing.expect(!t.modes.get(mode));
+        try testing.expect(!t.modes.restore(mode));
+    }
+    try testing.expectEqual(mouse.Event.none, t.flags.mouse_event);
+    try testing.expectEqual(mouse.Format.x10, t.flags.mouse_format);
+    try testing.expect(t.modes.get(.bracketed_paste));
+    try testing.expect(t.modes.get(.win32_input));
+    try testing.expectEqual(cursor_x, t.screens.active.cursor.x);
+    try testing.expectEqual(cursor_y, t.screens.active.cursor.y);
+    const after = try t.screens.active.dumpStringAlloc(testing.allocator, .{ .screen = .{} });
+    defer testing.allocator.free(after);
+    try testing.expectEqualStrings(before, after);
+
+    // Recovery is a mode reset, not a permanent configuration override.
+    s.nextSlice("\x1b[?1002;1006h");
+    try testing.expectEqual(mouse.Event.button, t.flags.mouse_event);
+    try testing.expectEqual(mouse.Format.sgr, t.flags.mouse_format);
+    try testing.expect(t.modes.get(.mouse_event_button));
+    try testing.expect(t.modes.get(.mouse_format_sgr));
+    try testing.expect(!t.modes.get(.mouse_event_any));
 }
 
 test "Terminal: softReset modes" {

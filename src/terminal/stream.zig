@@ -2057,6 +2057,12 @@ pub fn Stream(comptime H: type) type {
 
                 // c - Device Attributes (DA1)
                 'c' => {
+                    // DA queries accept only an omitted or zero parameter.
+                    // In particular, an echoed DA2 answer must not be treated
+                    // as another query, or replies can feed back indefinitely.
+                    if (input.params.len > 1 or
+                        (input.params.len == 1 and input.params[0] != 0)) return;
+
                     const req: ?device_attributes.Req = switch (input.intermediates.len) {
                         0 => .primary,
                         1 => switch (input.intermediates[0]) {
@@ -2643,7 +2649,11 @@ pub fn Stream(comptime H: type) type {
 
                     // Kitty keyboard protocol
                     1 => switch (input.intermediates[0]) {
-                        '?' => self.handler.vt(.kitty_keyboard_query, {}),
+                        '?' => {
+                            // The query is parameterless; any flags identify
+                            // a response that may have been echoed back.
+                            if (input.params.len == 0) self.handler.vt(.kitty_keyboard_query, {});
+                        },
 
                         '>' => push: {
                             const flags: u5 = if (input.params.len == 1)
@@ -4035,6 +4045,95 @@ test "stream: XTCHECKSUM dispatch" {
             try testing.expectEqual(flags, s.handler.flags.?);
         } else {
             try testing.expectEqual(0, s.handler.calls);
+        }
+    }
+}
+
+test "stream: terminal replies are not device attribute queries" {
+    const H = struct {
+        calls: usize = 0,
+        req: ?device_attributes.Req = null,
+
+        pub fn vt(self: *@This(), comptime action: Action.Tag, value: Action.Value(action)) void {
+            switch (action) {
+                .device_attributes => {
+                    self.calls += 1;
+                    self.req = value;
+                },
+                else => {},
+            }
+        }
+    };
+
+    const cases = [_]struct {
+        input: []const u8,
+        req: ?device_attributes.Req = null,
+    }{
+        .{ .input = "\x1b[c", .req = .primary },
+        .{ .input = "\x1b[0c", .req = .primary },
+        .{ .input = "\x1b[>c", .req = .secondary },
+        .{ .input = "\x1b[>0c", .req = .secondary },
+        .{ .input = "\x1b[=c", .req = .tertiary },
+        .{ .input = "\x1b[=0c", .req = .tertiary },
+        .{ .input = "\x1bZ", .req = .primary },
+        // An echoed answer must not start a reply/echo feedback loop.
+        .{ .input = "\x1b[>1;10;0c" },
+        .{ .input = "\x1b[>1;0;0c" },
+        .{ .input = "\x1b[?62;22;52c" },
+        .{ .input = "\x1b[1c" },
+        .{ .input = "\x1b[>1c" },
+        .{ .input = "\x1b[=1c" },
+        .{ .input = "\x1b[0;0c" },
+        .{ .input = "\x1b[>0;0c" },
+        .{ .input = "\x1b[=0;0c" },
+        .{ .input = "\x1b[0:0c" },
+        .{ .input = "\x1b[>0:0c" },
+        .{ .input = "\x1b[=0:0c" },
+    };
+
+    for (cases) |case| {
+        for (0..case.input.len + 1) |split| {
+            var s: Stream(H) = .init(.{ .handler = .{} });
+            s.nextSlice(case.input[0..split]);
+            if (split < case.input.len) try testing.expectEqual(0, s.handler.calls);
+            s.nextSlice(case.input[split..]);
+            try testing.expectEqual(@as(usize, if (case.req != null) 1 else 0), s.handler.calls);
+            try testing.expectEqual(case.req, s.handler.req);
+        }
+    }
+}
+
+test "stream: terminal replies are not kitty keyboard queries" {
+    const H = struct {
+        calls: usize = 0,
+
+        pub fn vt(self: *@This(), comptime action: Action.Tag, value: Action.Value(action)) void {
+            _ = value;
+            if (action == .kitty_keyboard_query) self.calls += 1;
+        }
+    };
+
+    const cases = [_]struct {
+        input: []const u8,
+        query: bool = false,
+    }{
+        .{ .input = "\x1b[?u", .query = true },
+        // Even zero flags identifies a response, not the parameterless query.
+        .{ .input = "\x1b[?0u" },
+        .{ .input = "\x1b[?1u" },
+        .{ .input = "\x1b[?31u" },
+        .{ .input = "\x1b[?65535u" },
+        .{ .input = "\x1b[?0;0u" },
+        .{ .input = "\x1b[?0:0u" },
+    };
+
+    for (cases) |case| {
+        for (0..case.input.len + 1) |split| {
+            var s: Stream(H) = .init(.{ .handler = .{} });
+            s.nextSlice(case.input[0..split]);
+            if (split < case.input.len) try testing.expectEqual(0, s.handler.calls);
+            s.nextSlice(case.input[split..]);
+            try testing.expectEqual(@as(usize, if (case.query) 1 else 0), s.handler.calls);
         }
     }
 }

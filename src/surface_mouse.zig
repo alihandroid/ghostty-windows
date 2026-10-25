@@ -13,9 +13,10 @@ const MouseShape = terminal.MouseShape;
 
 /// For processing key events; the key that was physically pressed on the
 /// keyboard.
-physical_key: input.Key,
+physical_key: input.Key = .unidentified,
 
-/// The mouse event tracking mode, if any.
+/// The effective mouse tracking mode, after applying the user's reporting
+/// preference.
 mouse_event: terminal.MouseEvent,
 
 /// The current terminal's mouse shape.
@@ -41,6 +42,12 @@ pub fn keyToMouseShape(self: SurfaceMouse) ?MouseShape {
     // Filter for appropriate key events
     if (!eligibleMouseShapeKeyEvent(self.physical_key)) return null;
 
+    return self.modifiersToMouseShape();
+}
+
+/// Resolve pointer shape after a modifier-only update, without synthesizing
+/// a key event or performing any terminal input/selection handling.
+pub fn modifiersToMouseShape(self: SurfaceMouse) ?MouseShape {
     // Exceptions: link hover or hidden state overrides any other shape
     // processing and does not change state.
     //
@@ -81,6 +88,12 @@ pub fn keyToMouseShape(self: SurfaceMouse) ?MouseShape {
     // shape. Note that this may be different than what has been currently sent
     // to the apprt, so this will force the reset.
     return self.mouse_shape;
+}
+
+/// Links belong to the terminal UI only when the application is not capturing
+/// the mouse, or when Shift releases that capture.
+pub fn linkHoverAllowed(mouse_event: terminal.MouseEvent, mods: input.Mods, shift_capture: bool) bool {
+    return mouse_event == .none or (mods.shift and !shift_capture);
 }
 
 fn eligibleMouseShapeKeyEvent(physical_key: input.Key) bool {
@@ -294,4 +307,34 @@ test "keyToMouseShape" {
         const got = m.keyToMouseShape();
         try testing.expect(want == got);
     }
+}
+
+test "link hover follows mouse capture override" {
+    const testing = std.testing;
+    try testing.expect(linkHoverAllowed(.none, .{}, false));
+    try testing.expect(linkHoverAllowed(.none, .{ .ctrl = true }, true));
+    try testing.expect(!linkHoverAllowed(.any, .{}, false));
+    try testing.expect(!linkHoverAllowed(.any, .{ .ctrl = true }, false));
+    try testing.expect(linkHoverAllowed(.any, .{ .ctrl = true, .shift = true }, false));
+    try testing.expect(!linkHoverAllowed(.any, .{ .ctrl = true, .shift = true }, true));
+}
+
+test "modifier-only pointer shape after link hover ends" {
+    var m: SurfaceMouse = .{
+        .mouse_event = .any,
+        .mouse_shape = .crosshair,
+        .mods = .{ .ctrl = true, .shift = true },
+        .over_link = true,
+        .hidden = false,
+    };
+    try std.testing.expectEqual(@as(?MouseShape, null), m.modifiersToMouseShape());
+
+    // Releasing Ctrl ends the URL hover but leaves Shift's selection override.
+    m.over_link = false;
+    m.mods.ctrl = false;
+    try std.testing.expectEqual(@as(?MouseShape, .text), m.modifiersToMouseShape());
+
+    // Releasing Shift then restores the application's pointer.
+    m.mods.shift = false;
+    try std.testing.expectEqual(@as(?MouseShape, .crosshair), m.modifiersToMouseShape());
 }

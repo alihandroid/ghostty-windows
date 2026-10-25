@@ -673,6 +673,12 @@ fn actionCommands(action: Action.Key) []const Command {
             .description = i18n.N_("Toggle whether mouse events are reported to terminal applications."),
         }},
 
+        .reset_mouse_reporting => comptime &.{.{
+            .action = .reset_mouse_reporting,
+            .title = i18n.N_("Reset Mouse Reporting"),
+            .description = i18n.N_("Stop mouse reports left behind by an application, preserving the terminal contents."),
+        }},
+
         .toggle_background_opacity => comptime &.{.{
             .action = .toggle_background_opacity,
             .title = i18n.N_("Toggle Background Opacity"),

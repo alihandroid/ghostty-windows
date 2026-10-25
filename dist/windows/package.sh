@@ -18,10 +18,12 @@ cd "$REPO_DIR"
 echo "Building ghostty (optimize=$OPTIMIZE)..."
 zig build -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu -Doptimize="$OPTIMIZE"
 
-if [ ! -f zig-out/bin/ghostty.exe ]; then
-    echo "ERROR: Build failed — ghostty.exe not found"
-    exit 1
-fi
+for resource in bin/ghostty.exe bin/conpty.dll bin/OpenConsole.exe share/terminfo/ghostty.terminfo share/licenses/conpty/LICENSE.txt; do
+    if [ ! -f "zig-out/$resource" ]; then
+        echo "ERROR: Incomplete Windows build — zig-out/$resource not found" >&2
+        exit 1
+    fi
+done
 
 # Get version string
 VERSION="$(powershell.exe -Command "& '.\\zig-out\\bin\\ghostty.exe' --version" 2>/dev/null | head -1 | tr -d '\r' | awk '{print $2}')" || true
@@ -35,9 +37,14 @@ STAGE_DIR="$REPO_DIR/dist/windows/_stage/ghostty"
 rm -rf "$REPO_DIR/dist/windows/_stage"
 mkdir -p "$STAGE_DIR"
 
-# Copy exe
-cp zig-out/bin/ghostty.exe "$STAGE_DIR/"
-echo "  ghostty.exe"
+# Keep the matching console runtime pair beside the executable.
+for binary in ghostty.exe conpty.dll OpenConsole.exe; do
+    cp "zig-out/bin/$binary" "$STAGE_DIR/"
+    echo "  $binary"
+done
+mkdir -p "$STAGE_DIR/share/licenses/conpty"
+cp zig-out/share/licenses/conpty/LICENSE.txt "$STAGE_DIR/share/licenses/conpty/"
+echo "  share/licenses/conpty/LICENSE.txt"
 
 # Copy share resources (themes, shell-integration)
 if [ -d zig-out/share/ghostty ]; then
@@ -70,6 +77,7 @@ QUICK START
   1. Run ghostty.exe
   2. Config file: %LOCALAPPDATA%\\ghostty\\config.ghostty
      (the legacy filename "config" is also supported)
+  Keep conpty.dll and OpenConsole.exe beside ghostty.exe.
 
 KEYBOARD SHORTCUTS
   Ctrl+Shift+T        New tab

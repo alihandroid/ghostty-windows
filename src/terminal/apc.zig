@@ -209,6 +209,20 @@ pub const Handler = struct {
         }
     }
 
+    /// Complete an APC for terminal execution, ignoring reflected glyph
+    /// replies so they cannot trigger another reply or clear registrations.
+    /// Raw protocol consumers can continue using end without this filter.
+    pub fn endRequest(self: *Handler) ?Command {
+        if (comptime build_options.glyph_protocol) {
+            if (self.state == .glyph and self.state.glyph.isResponse()) {
+                self.state.deinit();
+                self.state = .inactive;
+                return null;
+            }
+        }
+        return self.end();
+    }
+
     /// Complete the current APC. The caller owns a returned result and must
     /// call `Command.deinit` with the allocator used while feeding the APC.
     pub fn end(self: *Handler) ?Command {
@@ -671,6 +685,31 @@ test "valid glyph command" {
     defer result.deinit(alloc);
     try testing.expect(result == .glyph);
     try testing.expect(result.glyph == .query);
+}
+
+test "protocol replies: glyph request completion preserves raw parser behavior" {
+    if (comptime !build_options.glyph_protocol) return error.SkipZigTest;
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const replies = [_][]const u8{
+        "25a1;s;fmt=glyf",         "25a1;s;fmt=",     "25a1;q;cp=e0a0;status=",
+        "25a1;r;cp=e0a0;status=0", "25a1;c;status=0", "25a1;c;status=future",
+    };
+    for (replies) |reply| {
+        var h: Handler = .{};
+        defer h.deinit();
+        h.start();
+        h.feedSlice(alloc, reply);
+        try testing.expect(h.endRequest() == null);
+        try testing.expect(h.state == .inactive);
+
+        // Raw consumers can still decode protocol packets as before.
+        h.start();
+        h.feedSlice(alloc, reply);
+        var raw = h.end().?;
+        defer raw.deinit(alloc);
+        try testing.expect(raw == .glyph);
+    }
 }
 
 test "feedSlice valid Kitty command" {
