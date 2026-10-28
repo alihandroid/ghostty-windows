@@ -6,7 +6,9 @@ param(
 )
 $ErrorActionPreference='Stop'
 Add-Type -AssemblyName System.Drawing
-Add-Type -ReferencedAssemblies @('System.Drawing.Common','System.Drawing.Primitives','System.Private.Windows.Core','System.Runtime.InteropServices','System.ComponentModel.Primitives','System.Collections') -TypeDefinition @'
+$nativeReferences=@('System.Drawing.Common','System.Drawing.Primitives','System.Private.Windows.Core','System.Runtime.InteropServices','System.ComponentModel.Primitives','System.Collections')
+if(Test-Path (Join-Path $PSHOME 'System.Private.Windows.GdiPlus.dll')){$nativeReferences+='System.Private.Windows.GdiPlus'}
+Add-Type -ReferencedAssemblies $nativeReferences -TypeDefinition @'
 using System;
 using System.Collections.Generic;
 using System.Drawing;

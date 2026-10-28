@@ -1158,6 +1158,8 @@ pub const Handler = struct {
         self: *Handler,
         v: Action.Value(.kitty_clipboard),
     ) error{OutOfMemory}!void {
+        if (kitty_clipboard.Metadata.isResponse(v.metadata)) return;
+
         // Decode and validate the metadata.
         var arena: std.heap.ArenaAllocator = .init(self.terminal.gpa());
         defer arena.deinit();
@@ -2264,7 +2266,7 @@ pub const Handler = struct {
     fn apcEnd(self: *Handler, terminated: bool) void {
         const io = self.terminal.io();
         const alloc = self.terminal.gpa();
-        var result = self.apc_handler.end() orelse return;
+        var result = self.apc_handler.endRequest() orelse return;
         defer result.deinit(alloc);
         switch (result) {
             .unknown => |*unknown| {
@@ -3309,6 +3311,78 @@ test "glyph protocol APC with write_pty callback" {
     s.nextSlice("\x1B_25a1;r;cp=e0a0;AAAAAAAAAAAAAA==\x1B\\");
     try testing.expectEqualStrings("\x1B_25a1;r;cp=e0a0;status=0\x1B\\", S.last_response.?);
     try testing.expect(t.glyph_glossary.contains(0xE0A0));
+}
+
+test "protocol replies: reflected glyph responses neither reply nor clear other glyphs" {
+    if (comptime !build_options.glyph_protocol) return error.SkipZigTest;
+    var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(testing.allocator);
+
+    const S = struct {
+        var calls: usize = 0;
+        var response: [apc.glyph.Response.max_wire_bytes]u8 = undefined;
+        var len: usize = 0;
+        fn writePty(_: *Handler, data: []const u8) void {
+            calls += 1;
+            @memcpy(response[0..data.len], data);
+            len = data.len;
+        }
+    };
+    S.calls = 0;
+    S.len = 0;
+    var handler: Handler = .init(&t);
+    handler.effects.write_pty = &S.writePty;
+    var s: Stream = .init(.{ .allocator = testing.allocator, .handler = handler });
+    defer s.deinit();
+
+    // Requests still work, including a register fmt and unknown options.
+    s.nextSlice("\x1b_25a1;r;cp=e0a0;fmt=glyf;reply=0;future=option;AAAAAAAAAAAAAA==\x1b\\");
+    s.nextSlice("\x1b_25a1;r;cp=e0a1;reply=0;AAAAAAAAAAAAAA==\x1b\\");
+    try testing.expect(t.glyph_glossary.contains(0xE0A0));
+    try testing.expect(t.glyph_glossary.contains(0xE0A1));
+
+    const requests = [_][]const u8{
+        "\x1b_25a1;s;future=option\x1b\\",
+        "\x1b_25a1;q;cp=e0a0;future=option\x1b\\",
+        "\x1b_25a1;c;cp=e0a0\x1b\\",
+    };
+    for (requests, 1..) |request, count| {
+        s.nextSlice(request);
+        try testing.expectEqual(count, S.calls);
+        const reply = try testing.allocator.dupe(u8, S.response[0..S.len]);
+        defer testing.allocator.free(reply);
+        s.nextSlice(reply); // One bounded reflection of the real reply.
+        try testing.expectEqual(count, S.calls);
+        try testing.expect(t.glyph_glossary.contains(0xE0A1));
+    }
+    try testing.expect(!t.glyph_glossary.contains(0xE0A0));
+
+    // All response variants, including empty coverage and future error values,
+    // are ignored at every write boundary without changing registrations.
+    const replies = [_]apc.glyph.Response{
+        .{ .support = .{ .fmt = .{} } },
+        .{ .support = .{ .fmt = .{ .glyf = true } } },
+        .{ .query = .{ .cp = 0xE0A1, .status = .{} } },
+        .{ .query = .{ .cp = 0xE0A1, .status = .{ .glossary = true } } },
+        .{ .register = .{ .cp = 0xE0A1 } },
+        .{ .register = .{ .cp = 0xE0A1, .status = .err, .reason = .out_of_namespace } },
+        .{ .clear = .{} },
+        .{ .clear = .{ .status = @fromBackingInt(37), .reason = "future_error" } },
+    };
+    for (replies) |reply| {
+        var buffer: [apc.glyph.Response.max_wire_bytes]u8 = undefined;
+        var writer: std.Io.Writer = .fixed(&buffer);
+        try reply.formatWire(&writer);
+        const wire = writer.buffered();
+        for (0..wire.len + 1) |split| {
+            s.nextSlice(wire[0..split]);
+            s.nextSlice(wire[split..]);
+            try testing.expectEqual(requests.len, S.calls);
+            try testing.expect(t.glyph_glossary.contains(0xE0A1));
+            try testing.expect(!t.glyph_glossary.contains(0xE0A0));
+        }
+    }
+    try testing.expect(!s.handler.semantic_failure);
 }
 
 test "ignores query actions" {
@@ -4656,6 +4730,85 @@ const KittyClipboardCapture = struct {
         return last_data[i][0..last_data_lens[i]];
     }
 };
+
+test "protocol replies: reflected clipboard denials never produce another reply" {
+    var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(testing.allocator);
+    const S = KittyClipboardCapture;
+    var handler: Handler = .init(&t);
+    handler.effects.write_pty = &S.writePty;
+    var s: Stream = .init(.{ .allocator = testing.allocator, .handler = handler });
+    defer s.deinit();
+
+    for ([_][]const u8{
+        "\x1b]5522;type=read:id=audit;dGV4dC9wbGFpbg==\x1b\\",
+        "\x1b]5522;type=write:id=audit\x1b\\",
+    }) |request| {
+        S.reset();
+        s.nextSlice(request);
+        try testing.expect(S.responses_len > 0);
+        const reply = try testing.allocator.dupe(u8, S.responseSlice());
+        defer testing.allocator.free(reply);
+        S.responses_len = 0;
+        s.nextSlice(reply);
+        try testing.expectEqual(@as(usize, 0), S.responses_len);
+        try testing.expect(s.handler.kitty_clipboard_write == null);
+    }
+}
+
+test "protocol replies: clipboard responses preserve the active write transaction" {
+    var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(testing.allocator);
+    const S = KittyClipboardCapture;
+    S.reset();
+    var handler: Handler = .init(&t);
+    handler.effects.write_pty = &S.writePty;
+    handler.effects.clipboard_read = &S.clipboardRead;
+    handler.effects.clipboard_write = &S.clipboardWrite;
+    var s: Stream = .init(.{ .allocator = testing.allocator, .handler = handler });
+    defer s.deinit();
+
+    s.nextSlice("\x1b]5522;type=write:id=original:future=option\x1b\\");
+    s.nextSlice("\x1b]5522;type=wdata:mime=dGV4dC9wbGFpbg==;a2VwdA==\x1b\\"); // "kept"
+    const transaction = s.handler.kitty_clipboard_write.?;
+    const replies = [_][]const u8{
+        "\x1b]5522;type=read:status=OK\x1b\\",
+        "\x1b]5522;type=read:status=DATA:mime=dGV4dC9wbGFpbg==;aGVsbG8=\x1b\\",
+        "\x1b]5522;type=read:status=DONE\x1b\\",
+        "\x1b]5522;type=write:status=DONE\x1b\\",
+        "\x1b]5522;type=write:status=EPERM\x1b\\",
+        "\x1b]5522;type=write:status=FUTURE\x1b\\",
+        "\x1b]5522;type=write:status=:mime=!!!\x1b\\",
+        // Reply classification must precede malformed request decoding.
+        "\x1b]5522;type=wdata:status=DATA:mime=!!!;!!!\x1b\\",
+        "\x1b]5522;type=walias:status=FUTURE:mime=!!!;!!!\x1b\\",
+    };
+    for (replies) |reply| {
+        for (0..reply.len + 1) |split| {
+            s.nextSlice(reply[0..split]);
+            s.nextSlice(reply[split..]);
+            try testing.expect(s.handler.kitty_clipboard_write.? == transaction);
+            try testing.expectEqual(@as(usize, 0), S.responses_len);
+            try testing.expectEqual(@as(usize, 0), S.read_count);
+            try testing.expectEqual(@as(usize, 0), S.write_count);
+        }
+    }
+    s.nextSlice("\x1b]5522;type=wdata:mime=dGV4dC9wbGFpbg==;IGRhdGE=\x1b\\"); // " data"
+    s.nextSlice("\x1b]5522;type=wdata\x1b\\");
+    try testing.expect(s.handler.kitty_clipboard_write == null);
+    try testing.expectEqual(@as(usize, 1), S.write_count);
+    try testing.expectEqual(@as(usize, 1), S.last_contents_len);
+    try testing.expectEqualStrings("kept data", S.dataAt(0));
+    try testing.expectEqualStrings("\x1b]5522;type=write:status=DONE:id=original\x1b\\", S.responseSlice());
+    const reply = try testing.allocator.dupe(u8, S.responseSlice());
+    defer testing.allocator.free(reply);
+    S.responses_len = 0;
+    s.nextSlice(reply);
+    try testing.expect(s.handler.kitty_clipboard_write == null);
+    try testing.expectEqual(@as(usize, 0), S.responses_len);
+    try testing.expectEqual(@as(usize, 1), S.write_count);
+    try testing.expect(!s.handler.semantic_failure);
+}
 
 test "kitty clipboard write transaction round trip" {
     var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 80, .rows = 24 });

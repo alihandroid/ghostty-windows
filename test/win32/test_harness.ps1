@@ -373,7 +373,8 @@ function Invoke-Kill {
     } else {
         # Never match a developer's normal Ghostty terminal. The harness copy
         # has a deliberately unique process name for safe scoped cleanup.
-        Get-Process ghostty-test -ErrorAction SilentlyContinue | ForEach-Object {
+        Get-Process ghostty-test -ErrorAction SilentlyContinue |
+            Where-Object { -not $ExePath -or $_.Path -eq $ExePath } | ForEach-Object {
             & taskkill /PID $_.Id /T /F 2>$null | Out-Null
         }
         Write-Output "KILLED=test-processes"

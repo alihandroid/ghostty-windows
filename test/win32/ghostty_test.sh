@@ -12,11 +12,11 @@ set -uo pipefail
 # Most legacy cases use desktop-global keyboard/mouse injection. Refuse them
 # before launching or cleaning up anything on a developer's shared desktop.
 case "${1:-all}" in
-    list|resize|window_properties|program_window_resize|tab_overview) ;;
+    list|resize|window_properties|program_window_resize|tab_overview|reply_feedback|mouse_reporting) ;;
     *)
         if [ "${GHOSTTY_TEST_ISOLATED_DESKTOP:-}" != "1" ]; then
             echo "Input tests require a dedicated desktop and GHOSTTY_TEST_ISOLATED_DESKTOP=1." >&2
-            echo "Safe cases: program_window_resize, tab_overview, resize, window_properties." >&2
+            echo "Safe cases: program_window_resize, tab_overview, reply_feedback, mouse_reporting, resize, window_properties." >&2
             exit 2
         fi
         ;;
@@ -35,18 +35,22 @@ mkdir -p "$SCREENSHOT_DIR"
 # Copy the exe to a local Windows temp path to avoid SmartScreen / UNC
 # security prompts that block unattended execution from \\wsl.localhost.
 WIN_TEMP="$(cmd.exe /c "echo %TEMP%" 2>/dev/null | tr -d '\r')"
-LOCAL_EXE="${WIN_TEMP}\\ghostty-test.exe"
+LOCAL_STAGE="$(mktemp -d "$(wslpath "$WIN_TEMP")/ghostty-win32.XXXXXX")" || exit 1
+LOCAL_EXE="$(wslpath -w "$LOCAL_STAGE")\\ghostty-test.exe"
 echo "Copying exe to local path to avoid security prompts..."
-# Kill any leftover ghostty-test processes from a previous run; otherwise
-# the cp below races a still-mapped exe and fails (EBUSY) intermittently
-# when several tests are run back-to-back.
-powershell.exe -ExecutionPolicy Bypass -Command "Get-Process ghostty-test -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue" 2>/dev/null || true
-sleep 0.3
-# Retry the copy once if it fails (Windows file locking can be transient).
-cp "$REPO_DIR/zig-out/bin/ghostty.exe" "$(wslpath "$WIN_TEMP")/ghostty-test.exe" 2>/dev/null || {
-    sleep 0.5
-    cp "$REPO_DIR/zig-out/bin/ghostty.exe" "$(wslpath "$WIN_TEMP")/ghostty-test.exe"
-}
+# Keep the matching console backend beside the test executable. A unique
+# directory avoids replacing a DLL or host still used by another test run.
+if ! cp "$REPO_DIR/zig-out/bin/ghostty.exe" "$LOCAL_STAGE/ghostty-test.exe" ||
+    ! cp "$REPO_DIR/zig-out/bin/conpty.dll" "$REPO_DIR/zig-out/bin/OpenConsole.exe" "$LOCAL_STAGE/"; then
+    rm -rf "$LOCAL_STAGE"
+    exit 1
+fi
+mkdir -p "$LOCAL_STAGE/share/ghostty" "$LOCAL_STAGE/share/terminfo"
+if ! cp -r "$REPO_DIR/zig-out/share/ghostty/themes" "$REPO_DIR/zig-out/share/ghostty/shell-integration" "$LOCAL_STAGE/share/ghostty/" ||
+    ! cp "$REPO_DIR/zig-out/share/terminfo/ghostty.terminfo" "$LOCAL_STAGE/share/terminfo/"; then
+    rm -rf "$LOCAL_STAGE"
+    exit 1
+fi
 GHOSTTY_EXE="$LOCAL_EXE"
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -97,9 +101,8 @@ screenshot() {
 
 cleanup() {
     echo "Cleaning up ghostty processes..."
-    ps -Action kill 2>/dev/null || true
-    # Remove the temp exe copy
-    rm -f "$(wslpath "$WIN_TEMP")/ghostty-test.exe" 2>/dev/null || true
+    ps -Action kill -ExePath "$LOCAL_EXE" 2>/dev/null || true
+    rm -rf "$LOCAL_STAGE" 2>/dev/null || true
 }
 
 report() {
@@ -686,6 +689,28 @@ test_tab_overview() {
     echo "▶ test_tab_overview (test-owned HWND messages only)"
     local script
     script="$(wslpath -w "$SCRIPT_DIR/test_tab_overview.ps1")"
+    if powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$script" -ExePath "$GHOSTTY_EXE"; then
+        PASS=$((PASS + 1))
+    else
+        FAIL=$((FAIL + 1))
+    fi
+}
+
+test_reply_feedback() {
+    echo "▶ test_reply_feedback (no desktop input)"
+    local script
+    script="$(wslpath -w "$SCRIPT_DIR/test_reply_feedback.ps1")"
+    if powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$script" -ExePath "$GHOSTTY_EXE"; then
+        PASS=$((PASS + 1))
+    else
+        FAIL=$((FAIL + 1))
+    fi
+}
+
+test_mouse_reporting() {
+    echo "▶ test_mouse_reporting (test-owned mouse messages only)"
+    local script
+    script="$(wslpath -w "$SCRIPT_DIR/test_mouse_reporting.ps1")"
     if powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$script" -ExePath "$GHOSTTY_EXE"; then
         PASS=$((PASS + 1))
     else
@@ -1749,6 +1774,8 @@ list_tests() {
     echo "  auto_update_settings — Automatic update modes and forced manual checks"
     echo "  program_window_resize — Opt-in CSI 8 t resize and zero dimensions"
     echo "  tab_overview       — Search, switch, close, and exit with owned HWNDs"
+    echo "  reply_feedback     — Echoed replies stop after an SSH-style disconnect (WSL)"
+    echo "  mouse_reporting    — Stale SGR tracking resets at the WSL zsh prompt"
     echo "  notifications      — Desktop notification via OSC 9"
     echo "  window_size_config — Custom window size from config"
     echo "  search             — Search bar open/close/input"
@@ -1785,6 +1812,8 @@ run_test() {
         auto_update_settings) test_auto_update_settings ;;
         program_window_resize) test_program_window_resize ;;
         tab_overview)        test_tab_overview ;;
+        reply_feedback)      test_reply_feedback ;;
+        mouse_reporting)     test_mouse_reporting ;;
         notifications)       test_notifications ;;
         window_size_config)  test_window_size_config ;;
         search)              test_search ;;
@@ -1843,6 +1872,10 @@ case "${1:-all}" in
         test_program_window_resize
         echo ""
         test_tab_overview
+        echo ""
+        test_reply_feedback
+        echo ""
+        test_mouse_reporting
         echo ""
         test_notifications
         echo ""

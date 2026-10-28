@@ -1732,11 +1732,14 @@ fn searchCallback_(
 ///
 /// The renderer state mutex MUST NOT be held.
 fn modsChanged(self: *Surface, mods: input.Mods) void {
+    const binding_mods = mods.binding();
     // The only place we keep track of mods currently is on the mouse.
-    if (!self.mouse.mods.equal(mods)) {
+    if (!self.mouse.mods.equal(binding_mods)) {
         // The mouse mods only contain binding modifiers since we don't
         // want caps/num lock or sided modifiers to affect the mouse.
-        self.mouse.mods = mods.binding();
+        self.mouse.mods = binding_mods;
+        // A stationary pointer must be checked again when modifiers change.
+        self.mouse.link_point = null;
 
         // We also need to update the renderer so it knows if it should
         // highlight links. Additionally, mark the screen as dirty so
@@ -1760,6 +1763,67 @@ fn modsChanged(self: *Surface, mods: input.Mods) void {
     }
 }
 
+/// Update modifiers and link hover without encoding a key or changing the
+/// selection. The GUI thread must call this without the renderer mutex held.
+pub fn modifiersChangedCallback(self: *Surface, mods: input.Mods) !void {
+    const binding_mods = mods.binding();
+    if (self.mouse.mods.equal(binding_mods)) return;
+    self.modsChanged(binding_mods);
+    try self.mouseRefreshCaptureState();
+}
+
+/// Refresh pointer policy after modifiers or configured mouse capture change.
+/// The renderer mutex must not be held.
+fn mouseRefreshCaptureState(self: *Surface) !void {
+    const state = state: {
+        self.renderer_state.mutex.lockUncancelable(global.io());
+        defer self.renderer_state.mutex.unlock(global.io());
+
+        self.renderer_state.mouse.mods = self.mouseModsWithCapture(self.mouse.mods);
+        self.renderer_state.terminal.flags.dirty.clear = true;
+        // Clear before asking the runtime for the cursor position. A missing
+        // or occluded native surface must never retain a stale link cursor.
+        try self.mouseClearLinkHover(self.mouse.over_link);
+        break :state .{
+            .shape = (SurfaceMouse{
+                .mouse_event = self.effectiveMouseEvent(),
+                .mouse_shape = self.io.terminal.mouse_shape,
+                .mods = self.mouse.mods,
+                .over_link = false,
+                .hidden = self.mouse.hidden,
+            }).modifiersToMouseShape(),
+            .hover_allowed = SurfaceMouse.linkHoverAllowed(
+                self.effectiveMouseEvent(),
+                self.mouse.mods,
+                self.mouseShiftCapture(false),
+            ),
+        };
+    };
+
+    try self.queueRender();
+    if (state.shape) |shape| {
+        _ = try self.rt_app.performAction(.{ .surface = self }, .mouse_shape, shape);
+    }
+    if (!state.hover_allowed) return;
+
+    const pos = self.rt_surface.getCursorPos() catch return;
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
+    try self.mouseRefreshLinks(pos, self.posToViewport(pos.x, pos.y), false);
+}
+
+/// Clear native and renderer hover state. The renderer mutex must be held.
+fn mouseClearLinkHover(self: *Surface, over_link: bool) !void {
+    self.mouse.over_link = false;
+    self.mouse.link_point = null;
+    self.renderer_state.mouse.point = null;
+    if (!over_link) return;
+    self.io.terminal.screens.active.dirty.hyperlink_hover = true;
+    _ = try self.rt_app.performAction(.{ .surface = self }, .mouse_shape, self.io.terminal.mouse_shape);
+    _ = try self.rt_app.performAction(.{ .surface = self }, .mouse_over_link, .{ .url = "" });
+    try self.queueRender();
+}
+
 /// Call this whenever the mouse moves or mods changed. The time
 /// at which this is called may matter for the correctness of other
 /// mouse events (see cursorPosCallback) but this is shared logic
@@ -1770,12 +1834,18 @@ fn mouseRefreshLinks(
     pos_vp: terminal.point.Coordinate,
     over_link: bool,
 ) !void {
-    // If the position is outside our viewport, do nothing
-    if (pos.x < 0 or pos.y < 0) return;
+    self.mouse.over_link = false;
+    self.renderer_state.mouse.point = null;
+
+    const hover_allowed = pos.x >= 0 and pos.y >= 0 and SurfaceMouse.linkHoverAllowed(
+        self.effectiveMouseEvent(),
+        self.mouse.mods,
+        self.mouseShiftCapture(false),
+    );
 
     // Update the last point that we checked for links so we don't
     // recheck if the mouse moves some pixels to the same point.
-    self.mouse.link_point = pos_vp;
+    self.mouse.link_point = if (hover_allowed) pos_vp else null;
 
     // We use an arena for everything below to make things easy to clean up.
     // In the case we don't do any allocs this is very cheap to setup
@@ -1788,6 +1858,7 @@ fn mouseRefreshLinks(
     // isn't a link OR if we shouldn't be showing links for some reason
     // (see further comments for cases).
     const link_: ?apprt.action.MouseOverLink, const preview: bool = link: {
+        if (!hover_allowed) break :link .{ null, false };
         // If we clicked and our mouse moved cells then we never
         // highlight links until the mouse is unclicked. This follows
         // standard macOS and Linux behavior where a click and drag cancels
@@ -1858,22 +1929,9 @@ fn mouseRefreshLinks(
         return;
     }
 
-    // No link, if we're previously over a link then we need to clear
-    // the over-link apprt state.
-    if (over_link) {
-        _ = try self.rt_app.performAction(
-            .{ .surface = self },
-            .mouse_shape,
-            self.io.terminal.mouse_shape,
-        );
-        _ = try self.rt_app.performAction(
-            .{ .surface = self },
-            .mouse_over_link,
-            .{ .url = "" },
-        );
-        try self.queueRender();
-        return;
-    }
+    try self.mouseClearLinkHover(over_link);
+    // This position was freshly checked, even if it contained no URL.
+    if (hover_allowed) self.mouse.link_point = pos_vp;
 }
 
 /// Called when our renderer health state changes.
@@ -3017,52 +3075,15 @@ pub fn keyCallback(
         self.hideMouse();
     }
 
-    // If our mouse modifiers change we may need to change our
-    // link highlight state.
-    if (!self.mouse.mods.equal(event.mods)) mouse_mods: {
-        // Update our modifiers, this will update mouse mods too
-        self.modsChanged(event.mods);
-
-        // We only refresh links if
-        // 1. mouse reporting is off
-        // OR
-        // 2. mouse reporting is on and we are not reporting shift to the terminal
-        if (self.io.terminal.flags.mouse_event == .none or
-            (self.mouse.mods.shift and !self.mouseShiftCapture(false)))
-        {
-            // Refresh our link state
-            const pos = self.rt_surface.getCursorPos() catch break :mouse_mods;
-            self.renderer_state.mutex.lockUncancelable(global.io());
-            defer self.renderer_state.mutex.unlock(global.io());
-            self.mouseRefreshLinks(
-                pos,
-                self.posToViewport(pos.x, pos.y),
-                self.mouse.over_link,
-            ) catch |err| {
-                log.warn("failed to refresh links err={}", .{err});
-                break :mouse_mods;
-            };
-        } else if (self.io.terminal.flags.mouse_event != .none and !self.mouse.mods.shift) {
-            // If we have mouse reports on and we don't have shift pressed, we reset state
-            _ = try self.rt_app.performAction(
-                .{ .surface = self },
-                .mouse_shape,
-                self.io.terminal.mouse_shape,
-            );
-            _ = try self.rt_app.performAction(
-                .{ .surface = self },
-                .mouse_over_link,
-                .{ .url = "" },
-            );
-            try self.queueRender();
-        }
-    }
+    self.modifiersChangedCallback(event.mods) catch |err| {
+        log.warn("failed to refresh modifier link state err={}", .{err});
+    };
 
     // Process the cursor state logic. This will update the cursor shape if
     // needed, depending on the key state.
     if ((SurfaceMouse{
         .physical_key = event.key,
-        .mouse_event = self.io.terminal.flags.mouse_event,
+        .mouse_event = self.effectiveMouseEvent(),
         .mouse_shape = self.io.terminal.mouse_shape,
         .mods = self.mouse.mods,
         .over_link = self.mouse.over_link,
@@ -3846,12 +3867,12 @@ pub fn scrollCallback(
         }
 
         // We scroll by the number of rows in the offset and save the remainder
-        const amount = poff / cell_size;
+        const amount = @trunc(poff / cell_size);
         assert(@abs(amount) >= 1);
         self.mouse.pending_scroll_y = poff - (amount * cell_size);
 
         // Round towards zero.
-        const delta: isize = @intFromFloat(@trunc(amount));
+        const delta: isize = @intFromFloat(amount);
         assert(@abs(delta) >= 1);
 
         break :y .{ .delta = delta };
@@ -3871,10 +3892,10 @@ pub fn scrollCallback(
             break :x .{};
         }
 
-        const amount = poff / cell_size;
+        const amount = @trunc(poff / cell_size);
         assert(@abs(amount) >= 1);
         self.mouse.pending_scroll_x = poff - (amount * cell_size);
-        const delta: isize = @intFromFloat(@trunc(amount));
+        const delta: isize = @intFromFloat(amount);
         assert(@abs(delta) >= 1);
         break :x .{ .delta = delta };
     };
@@ -4004,8 +4025,15 @@ pub fn contentScaleCallback(self: *Surface, content_scale: apprt.ContentScale) !
 /// Returns true if mouse reporting is enabled both in the config and
 /// the terminal state.
 fn isMouseReporting(self: *const Surface) bool {
-    return self.config.mouse_reporting and
-        self.io.terminal.flags.mouse_event != .none;
+    return self.effectiveMouseEvent() != .none;
+}
+
+/// Apply the user's reporting preference before resolving mouse UI policy.
+fn effectiveMouseEvent(self: *const Surface) terminal.MouseEvent {
+    return if (self.config.mouse_reporting)
+        self.io.terminal.flags.mouse_event
+    else
+        .none;
 }
 
 pub fn mouseReportingActive(self: *Surface) bool {
@@ -4113,7 +4141,7 @@ fn mouseShiftCapture(self: *const Surface, lock: bool) bool {
 pub fn mouseCaptured(self: *Surface) bool {
     self.renderer_state.mutex.lockUncancelable(global.io());
     defer self.renderer_state.mutex.unlock(global.io());
-    return self.io.terminal.flags.mouse_event != .none;
+    return self.isMouseReporting();
 }
 
 /// Called for mouse button press/release events. This will return true
@@ -4739,7 +4767,7 @@ fn linkAtPin(
 fn mouseModsWithCapture(self: *Surface, mods: input.Mods) input.Mods {
     // In any of these scenarios, whatever mods are set (even shift)
     // are preserved.
-    if (self.io.terminal.flags.mouse_event == .none) return mods;
+    if (!self.isMouseReporting()) return mods;
     if (!mods.shift) return mods;
     if (self.mouseShiftCapture(false)) return mods;
 
@@ -4964,15 +4992,10 @@ pub fn cursorPosCallback(
     // OR
     // 2. the cursor position has changed (either we have no previous state, or the state has
     //    changed)
-    // AND
-    // 1. mouse reporting is off
-    // OR
-    // 2. mouse reporting is on and we are not reporting shift to the terminal
-    if ((over_link or
+    // The refresh also clears native hover when application capture resumes.
+    if (over_link or
         self.mouse.link_point == null or
-        (self.mouse.link_point != null and !self.mouse.link_point.?.eql(pos_vp))) and
-        (self.io.terminal.flags.mouse_event == .none or
-            (self.mouse.mods.shift and !self.mouseShiftCapture(false))))
+        (self.mouse.link_point != null and !self.mouse.link_point.?.eql(pos_vp)))
     {
         // If we were previously over a link, we always update. We do this so that if the text
         // changed underneath us, even if the mouse didn't move, we update the URL hints and state
@@ -5815,7 +5838,31 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
 
         .toggle_mouse_reporting => {
             self.config.mouse_reporting = !self.config.mouse_reporting;
+            // The pointer may remain stationary, so invalidate and refresh
+            // hover and modifier policy when capture changes explicitly.
+            try self.mouseRefreshCaptureState();
             log.debug("mouse reporting toggled: {}", .{self.config.mouse_reporting});
+        },
+
+        .reset_mouse_reporting => {
+            {
+                self.renderer_state.mutex.lockUncancelable(global.io());
+                defer self.renderer_state.mutex.unlock(global.io());
+                self.io.terminal.resetMouseReporting();
+                self.mouse.click_state = @splat(.release);
+                self.mouse.event_point = null;
+                self.mouse.pressure_stage = .none;
+                self.mouse.pending_scroll_x = 0;
+                self.mouse.pending_scroll_y = 0;
+                self.mouse.selection_gesture.reset(&self.io.terminal);
+                self.selection_scroll_active = false;
+            }
+            if (comptime @hasDecl(apprt.Surface, "cancelMouseCapture")) {
+                self.rt_surface.cancelMouseCapture();
+            }
+            self.showMouse();
+            _ = try self.rt_app.performAction(.{ .surface = self }, .mouse_shape, .text);
+            try self.queueRender();
         },
 
         .toggle_command_palette => return try self.rt_app.performAction(
@@ -6896,6 +6943,159 @@ test "queueIo frees allocated writes in readonly mode" {
         .alloc = testing.allocator,
         .data = data,
     } }, .unlocked);
+}
+
+test "Surface precision scroll retains fractional cells" {
+    const testing = std.testing;
+    const Case = struct { first: f64, second: f64, rows: isize };
+    const cases = [_]Case{
+        .{ .first = 15.5, .second = 4.5, .rows = 2 },
+        .{ .first = -15.5, .second = -4.5, .rows = -2 },
+        // Changing direction can consume a partial cell without scrolling.
+        .{ .first = 15.5, .second = -5.5, .rows = 1 },
+        .{ .first = -15.5, .second = 5.5, .rows = -1 },
+    };
+    for (cases) |case| {
+        const surface = try testing.allocator.create(Surface);
+        defer testing.allocator.destroy(surface);
+        surface.mouse = .{};
+        surface.config.mouse_reporting = false;
+        surface.config.mouse_scroll_multiplier = .{ .precision = 1, .discrete = 1 };
+        surface.size = .{
+            .screen = .{ .width = 80, .height = 20 },
+            .cell = .{ .width = 10, .height = 10 },
+            .padding = .{},
+        };
+        surface.io.terminal = try terminal.Terminal.init(global.io(), testing.allocator, .{ .cols = 8, .rows = 2 });
+        defer surface.io.terminal.deinit(testing.allocator);
+        const term = &surface.io.terminal;
+        var stream: terminal.TerminalStream = .init(.{
+            .allocator = testing.allocator,
+            .handler = .init(term),
+        });
+        defer stream.deinit();
+        stream.nextSlice("0\r\n1\r\n2\r\n3\r\n4\r\n5\r\n6\r\n7\r\n8");
+        term.scrollViewport(.{ .delta = -3 });
+        const start: isize = @intCast(term.screens.active.pages.scrollbar().offset);
+
+        var mutex: std.Io.Mutex = .init;
+        surface.renderer_state = .{ .mutex = &mutex, .terminal = term };
+        surface.renderer_thread.wakeup = try global.xev.Async.init();
+        defer surface.renderer_thread.wakeup.deinit();
+
+        // Exercise the real callback on the main screen with reporting off:
+        // no native cursor lookup or input injection is needed.
+        try surface.scrollCallback(case.first, case.first, .{ .precision = true });
+        const remainder = case.first - @trunc(case.first / 10) * 10;
+        try testing.expectEqual(remainder, surface.mouse.pending_scroll_x);
+        try testing.expectEqual(remainder, surface.mouse.pending_scroll_y);
+        try surface.scrollCallback(case.second, case.second, .{ .precision = true });
+        const end: isize = @intCast(term.screens.active.pages.scrollbar().offset);
+        try testing.expectEqual(case.rows, start - end);
+        try testing.expectEqual(@as(f64, 0), surface.mouse.pending_scroll_x);
+        try testing.expectEqual(@as(f64, 0), surface.mouse.pending_scroll_y);
+    }
+}
+
+test "Surface toggle mouse reporting refreshes link hover and modifier shapes" {
+    const build_config = @import("build_config.zig");
+    if (comptime build_config.app_runtime != .win32 or build_config.artifact != .exe)
+        return error.SkipZigTest;
+
+    const testing = std.testing;
+    const w32 = @import("apprt/win32/win32.zig");
+    const Native = struct {
+        extern "user32" fn GetCursor() callconv(.winapi) ?w32.HCURSOR;
+    };
+    const saved_cursor = Native.GetCursor();
+    defer _ = w32.SetCursor(saved_cursor);
+
+    var core_app: App = undefined;
+    core_app.alloc = testing.allocator;
+    var app: apprt.runtime.App = undefined;
+    app.core_app = &core_app;
+    const native_surface = try testing.allocator.create(apprt.runtime.Surface);
+    defer testing.allocator.destroy(native_surface);
+    native_surface.* = .{ .app = &app, .core_surface_ready = true };
+    const surface = &native_surface.core_surface;
+    surface.alloc = testing.allocator;
+    surface.rt_app = &app;
+    surface.rt_surface = native_surface;
+    surface.inspector = null;
+    surface.mouse = .{ .mods = input.ctrlOrSuper(.{}) };
+    surface.config.mouse_reporting = true;
+    surface.config.mouse_shift_capture = .false;
+    surface.config.link_osc8 = true;
+    surface.config.links = &.{};
+    surface.config.link_previews = .false;
+    surface.size = .{
+        .screen = .{ .width = 80, .height = 20 },
+        .cell = .{ .width = 10, .height = 10 },
+        .padding = .{},
+    };
+    surface.io.terminal = try terminal.Terminal.init(global.io(), testing.allocator, .{ .cols = 8, .rows = 2 });
+    defer surface.io.terminal.deinit(testing.allocator);
+    const term = &surface.io.terminal;
+    var stream: terminal.TerminalStream = .init(.{
+        .allocator = testing.allocator,
+        .handler = .init(term),
+    });
+    defer stream.deinit();
+    stream.nextSlice("\x1b]8;;https://example.com\x1b\\link\x1b]8;;\x1b\\\x1b[?1003;1006h");
+    term.mouse_shape = .progress;
+    var mutex: std.Io.Mutex = .init;
+    surface.renderer_state = .{ .mutex = &mutex, .terminal = term };
+    surface.renderer_thread.wakeup = try global.xev.Async.init();
+    defer surface.renderer_thread.wakeup.deinit();
+    surface.io.mailbox = try termio.Mailbox.initSPSC(testing.allocator);
+    defer surface.io.mailbox.deinit(testing.allocator);
+
+    const pos: apprt.CursorPos = .{ .x = 5, .y = 5 };
+    const point = surface.posToViewport(pos.x, pos.y);
+    try testing.expect(surface.mouseCaptured());
+    try testing.expect(try surface.performBindingAction(.toggle_mouse_reporting));
+    try testing.expect(!surface.mouseCaptured());
+    try testing.expectEqual(terminal.MouseEvent.none, surface.effectiveMouseEvent());
+    try testing.expectEqual(terminal.MouseEvent.any, term.flags.mouse_event);
+
+    // No HWND: toggling must invalidate state before a cursor lookup can
+    // fail. A subsequent position event at the same cell must find the link.
+    try surface.cursorPosCallback(pos, null);
+    try testing.expect(surface.mouse.over_link);
+    try testing.expectEqual(point, surface.mouse.link_point.?);
+    try testing.expectEqual(point, surface.renderer_state.mouse.point.?);
+    try testing.expectEqual(w32.LoadCursorW(null, w32.IDC_HAND), native_surface.current_cursor);
+
+    // Re-enabling capture at a stationary pointer clears the existing hover
+    // immediately, without requiring any position or modifier event.
+    try testing.expect(try surface.performBindingAction(.toggle_mouse_reporting));
+    try testing.expect(surface.mouseCaptured());
+    try testing.expect(!surface.mouse.over_link);
+    try testing.expect(surface.mouse.link_point == null);
+    try testing.expect(surface.renderer_state.mouse.point == null);
+    try testing.expectEqual(w32.LoadCursorW(null, w32.IDC_APPSTARTING), native_surface.current_cursor);
+
+    try testing.expect(try surface.performBindingAction(.toggle_mouse_reporting));
+    try surface.cursorPosCallback(pos, null);
+    try testing.expect(surface.mouse.over_link);
+
+    // With reporting disabled Ctrl+Alt selects rectangles without Shift.
+    // Enabling capture must restore the application's cursor even though
+    // the modifiers and pointer position have not changed.
+    try surface.modifiersChangedCallback(input.ctrlOrSuper(.{ .alt = true }));
+    try testing.expect(!surface.mouse.over_link);
+    try testing.expectEqual(w32.LoadCursorW(null, w32.IDC_CROSS), native_surface.current_cursor);
+    try testing.expect(try surface.performBindingAction(.toggle_mouse_reporting));
+    try testing.expectEqual(w32.LoadCursorW(null, w32.IDC_APPSTARTING), native_surface.current_cursor);
+
+    // Shift only acts as a capture override while reporting is enabled.
+    const ctrl_shift = input.ctrlOrSuper(.{ .shift = true });
+    try surface.modifiersChangedCallback(ctrl_shift);
+    try testing.expect(surface.renderer_state.mouse.mods.equal(input.ctrlOrSuper(.{})));
+    try testing.expect(try surface.performBindingAction(.toggle_mouse_reporting));
+    try testing.expect(surface.renderer_state.mouse.mods.equal(ctrl_shift));
+    try testing.expectEqual(terminal.MouseEvent.any, term.flags.mouse_event);
+    try testing.expect(surface.io.mailbox.spsc.queue.pop(global.io()) == null);
 }
 
 test "Mouse.click_state holds every button" {

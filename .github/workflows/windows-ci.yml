@@ -81,6 +81,16 @@ jobs:
             }
           }
 
+      - name: Test development build installation (5.1 and 7)
+        shell: pwsh
+        run: |
+          foreach ($engine in @("powershell.exe", "pwsh.exe")) {
+            & $engine -NoProfile -NonInteractive -ExecutionPolicy Bypass -File test/win32/test_dev_install.ps1
+            if ($LASTEXITCODE -ne 0) {
+              throw "Development build installation failed under $engine"
+            }
+          }
+
       - name: Test
         run: zig build test -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu
 

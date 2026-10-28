@@ -324,6 +324,8 @@ const PosixPty = struct {
 
 /// Windows PTY creation and management.
 const WindowsPty = struct {
+    const Conpty = @import("os/Conpty.zig");
+
     pub const Error = OpenError || GetSizeError || SetSizeError;
 
     pub const Fd = windows.HANDLE;
@@ -336,13 +338,16 @@ const WindowsPty = struct {
     out_pipe_pty: windows.HANDLE,
     in_pipe_pty: windows.HANDLE,
     pseudo_console: windows.HPCON,
+    conpty: Conpty,
     size: winsize,
 
-    pub const OpenError = error{Unexpected};
+    pub const OpenError = Conpty.Error;
 
     /// Open a new PTY with the given initial size.
     pub fn open(size: winsize) OpenError!Pty {
         var pty: Pty = undefined;
+        pty.conpty = try .init();
+        errdefer pty.conpty.deinit();
 
         var pipe_path_buf: [128]u8 = undefined;
         var pipe_path_buf_w: [128]u16 = undefined;
@@ -447,14 +452,17 @@ const WindowsPty = struct {
         _ = windows.exp.kernel32.SetConsoleCP(65001);
         _ = windows.exp.kernel32.SetConsoleOutputCP(65001);
 
-        const result = windows.exp.kernel32.CreatePseudoConsole(
+        const result = pty.conpty.create(
             .{ .X = @intCast(size.ws_col), .Y = @intCast(size.ws_row) },
             pty.in_pipe_pty,
             pty.out_pipe_pty,
             0,
             &pty.pseudo_console,
         );
-        if (result != windows.S_OK) return error.Unexpected;
+        if (result != windows.S_OK) {
+            log.err("pseudoconsole creation failed hresult=0x{x}", .{@as(u32, @bitCast(result))});
+            return error.Unexpected;
+        }
 
         pty.size = size;
         return pty;
@@ -465,7 +473,8 @@ const WindowsPty = struct {
         _ = windows.exp.kernel32.CloseHandle(self.in_pipe);
         _ = windows.exp.kernel32.CloseHandle(self.out_pipe_pty);
         _ = windows.exp.kernel32.CloseHandle(self.out_pipe);
-        _ = windows.exp.kernel32.ClosePseudoConsole(self.pseudo_console);
+        self.conpty.close(self.pseudo_console);
+        self.conpty.deinit();
         self.* = undefined;
     }
 
@@ -480,7 +489,7 @@ const WindowsPty = struct {
 
     /// Set the size of the pty.
     pub fn setSize(self: *Pty, size: winsize) SetSizeError!void {
-        const result = windows.exp.kernel32.ResizePseudoConsole(
+        const result = self.conpty.resize(
             self.pseudo_console,
             .{ .X = @intCast(size.ws_col), .Y = @intCast(size.ws_row) },
         );

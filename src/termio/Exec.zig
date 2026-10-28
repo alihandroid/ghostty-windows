@@ -937,6 +937,10 @@ const Subprocess = struct {
             break :shell integration.command;
         };
 
+        if (comptime builtin.target.os.tag == .windows) {
+            try @import("wsl.zig").setup(&env);
+        }
+
         // Add the environment variables that override any others.
         {
             var it = cfg.env_override.iterator();

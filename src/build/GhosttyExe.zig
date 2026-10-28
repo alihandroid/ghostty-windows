@@ -76,6 +76,25 @@ pub fn init(b: *std.Build, cfg: *const Config, deps: *const SharedDeps) !Ghostty
 pub fn install(self: *const Ghostty) void {
     const b = self.install_step.step.owner;
     b.getInstallStep().dependOn(&self.install_step.step);
+
+    const target = self.exe.root_module.resolved_target.?;
+    if (target.result.os.tag == .windows) {
+        // Copy Microsoft's matching runtime pair; loading it dynamically
+        // keeps GNU cross-builds independent of MSVC import libraries.
+        const conpty = b.lazyDependency("conpty", .{ .target = target }) orelse return;
+        b.getInstallStep().dependOn(&b.addInstallBinFile(
+            conpty.namedLazyPath("dll"),
+            "conpty.dll",
+        ).step);
+        b.getInstallStep().dependOn(&b.addInstallBinFile(
+            conpty.namedLazyPath("host"),
+            "OpenConsole.exe",
+        ).step);
+        b.getInstallStep().dependOn(&b.addInstallFile(
+            b.path("dist/windows/conpty-LICENSE.txt"),
+            "share/licenses/conpty/LICENSE.txt",
+        ).step);
+    }
 }
 
 /// If we're in NixOS but not in the shell environment then we issue

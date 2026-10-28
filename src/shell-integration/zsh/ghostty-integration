@@ -101,6 +101,11 @@ _ghostty_deferred_init() {
         # Don't write OSC 133 D when our precmd handler is invoked from zle.
         # Some plugins do that to update prompt on cd.
         if ! builtin zle; then
+            # A crashed TUI or disconnected SSH session may leave mouse
+            # tracking enabled. Stop reporting coordinates at the local
+            # prompt; the next application can enable tracking normally.
+            builtin print -nu $_ghostty_fd '\e[?9;1000;1002;1003;1005;1006;1015;1016l'
+
             # This code works incorrectly in the presence of a precmd or chpwd
             # hook that prints. For example, sindresorhus/pure prints an empty
             # line on precmd and marlonrichert/zsh-snap prints $PWD on chpwd.

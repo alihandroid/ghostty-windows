@@ -465,6 +465,51 @@ fn deinitGui(self: *Surface) void {
     log.debug("surface deinit: complete", .{});
 }
 
+/// Move the terminal child and its top-level popups together. Each popup has
+/// a non-null owner, so a zero previous owner from SetWindowLongPtrW means
+/// the transfer failed. Restore every completed change before returning.
+pub fn reparentNativeWindows(self: *Surface, parent: w32.HWND) !void {
+    const hwnd = self.hwnd orelse return;
+    const previous_parent = w32.SetParent(hwnd, parent) orelse return error.Win32Error;
+    errdefer _ = w32.SetParent(hwnd, previous_parent);
+
+    const popups = [_]?w32.HWND{ self.search_hwnd, self.palette_hwnd, self.link_preview_hwnd };
+    var previous_owners: [popups.len]isize = @splat(0);
+    errdefer for (popups, previous_owners) |popup, owner| {
+        if (owner != 0) _ = w32.SetWindowLongPtrW(popup.?, w32.GWLP_HWNDPARENT, owner);
+    };
+    for (popups, 0..) |popup, i| {
+        const h = popup orelse continue;
+        const owner = w32.SetWindowLongPtrW(h, w32.GWLP_HWNDPARENT, @bitCast(@intFromPtr(parent)));
+        if (owner == 0) return error.Win32Error;
+        previous_owners[i] = owner;
+    }
+}
+
+/// A popup can be destroyed without destroying its terminal surface.
+pub fn popupDestroyed(self: *Surface, hwnd: w32.HWND) void {
+    if (self.search_hwnd == hwnd) {
+        self.search_hwnd = null;
+        self.search_edit = null;
+        self.search_count_label = null;
+        self.search_active = false;
+        self.search_total = null;
+        self.search_selected = null;
+        if (self.search_font) |font| _ = w32.DeleteObject(font);
+        self.search_font = null;
+    } else if (self.palette_hwnd == hwnd) {
+        self.palette_hwnd = null;
+        self.palette_edit = null;
+        self.palette_active = false;
+        if (self.palette_font) |font| _ = w32.DeleteObject(font);
+        self.palette_font = null;
+        if (self.palette_paint_font) |font| _ = w32.DeleteObject(font);
+        self.palette_paint_font = null;
+        if (self.palette_brush) |brush| _ = w32.DeleteObject(brush);
+        self.palette_brush = null;
+    }
+}
+
 /// WGL contexts are per-surface; the shared renderer device has no options.
 pub fn renderDeviceOptions(_: *Surface) !@import("../../renderer.zig").Device.Options {
     return .{};
@@ -1430,6 +1475,7 @@ const palette_entries = [_]PaletteEntry{
     .{ .name = "Toggle Quick Terminal", .action = .toggle_quick_terminal },
     .{ .name = "Toggle Read-Only", .action = .toggle_readonly },
     .{ .name = "Toggle Mouse Reporting", .action = .toggle_mouse_reporting },
+    .{ .name = "Reset Mouse Reporting", .action = .reset_mouse_reporting },
     .{ .name = "Copy to Clipboard", .action = .{ .copy_to_clipboard = .mixed } },
     .{ .name = "Paste from Clipboard", .action = .paste_from_clipboard },
     .{ .name = "Copy URL to Clipboard", .action = .copy_url_to_clipboard },
@@ -2119,6 +2165,16 @@ pub fn handleKeyEvent(self: *Surface, wparam: usize, lparam: isize, action: inpu
     // for copy) so they work in this mode. Only fall through to
     // Win32 input encoding if no binding matched.
     if (self.isWin32InputMode()) {
+        if (key.modifier()) {
+            // Modifier keys bypass keyCallback in this mode, but link hover
+            // still needs updating when Ctrl/Shift change under a stationary
+            // pointer. This callback only updates UI state; the original
+            // Win32 input event below remains the sole input sent to ConPTY.
+            self.core_surface.modifiersChangedCallback(mods) catch |err| {
+                log.err("modifier callback error: {}", .{err});
+            };
+        }
+
         // Check keybindings for non-modifier keys (Ctrl+Shift+C, etc.).
         // Modifier-only keys never have bindings, and sending them
         // through keyCallback would clear the selection.
@@ -2289,6 +2345,13 @@ pub fn handleCharEvent(self: *Surface, wparam: usize) void {
     }) catch |err| {
         log.err("text input callback error: {}", .{err});
     };
+}
+
+/// Release pointer capture when recovering from an interrupted mouse session.
+pub fn cancelMouseCapture(self: *Surface) void {
+    if (self.mouse_button_mask == 0) return;
+    self.mouse_button_mask = 0;
+    _ = w32.ReleaseCapture();
 }
 
 /// Handle WM_LBUTTONDOWN / WM_RBUTTONDOWN / WM_MBUTTONDOWN /
@@ -2838,6 +2901,11 @@ fn writeWin32InputSequence(
     cs: u32,
     rc: u16,
 ) void {
+    // Keyboard, standalone WM_CHAR, and IME input all share this emitter.
+    // These writes bypass the core's queueIo filter, so apply its read-only
+    // policy here while allowing keybindings to run before emission.
+    if (self.core_surface.readonly) return;
+
     var buf: [64]u8 = undefined;
     const seq = std.mem.print(&buf, "\x1b[{};{};{};{};{};{}_", .{
         vk, sc, uc, kd, cs, rc,
@@ -3119,4 +3187,180 @@ pub fn core(self: *Surface) *CoreSurface {
 /// Return a reference to the App for use by core code.
 pub fn rtApp(self: *Surface) *App {
     return self.app;
+}
+
+test "Win32 modifier releases clear link hover without changing selection or input" {
+    const testing = std.testing;
+    const Native = struct {
+        extern "user32" fn SetKeyboardState(state: *const [256]u8) callconv(.winapi) i32;
+        extern "user32" fn GetCursor() callconv(.winapi) ?w32.HCURSOR;
+    };
+
+    // SetKeyboardState affects only this thread's input queue. Never inject
+    // global input or move the real pointer to test a modifier transition.
+    var saved_keys: [256]u8 = undefined;
+    if (w32.GetKeyboardState(&saved_keys) == 0) return error.Win32Error;
+    defer _ = Native.SetKeyboardState(&saved_keys);
+    const saved_cursor = Native.GetCursor();
+    defer _ = w32.SetCursor(saved_cursor);
+
+    const Release = struct {
+        vk: u16,
+        scancode: u16,
+        remaining: input.Mods,
+        expected_input: []const u8,
+    };
+    const orders = [_][2]Release{
+        .{
+            .{ .vk = w32.VK_SHIFT, .scancode = 42, .remaining = .{ .ctrl = true }, .expected_input = "\x1b[16;42;0;0;8;1_" },
+            .{ .vk = w32.VK_CONTROL, .scancode = 29, .remaining = .{}, .expected_input = "\x1b[17;29;0;0;0;1_" },
+        },
+        .{
+            .{ .vk = w32.VK_CONTROL, .scancode = 29, .remaining = .{ .shift = true }, .expected_input = "\x1b[17;29;0;0;16;1_" },
+            .{ .vk = w32.VK_SHIFT, .scancode = 42, .remaining = .{}, .expected_input = "\x1b[16;42;0;0;0;1_" },
+        },
+    };
+
+    for (orders) |order| {
+        var core_app: @import("../../App.zig") = undefined;
+        core_app.alloc = testing.allocator;
+        var app: App = undefined;
+        app.core_app = &core_app;
+        const surface = try testing.allocator.create(Surface);
+        defer testing.allocator.destroy(surface);
+        surface.* = .{ .app = &app, .core_surface_ready = true };
+
+        const core_surface = &surface.core_surface;
+        core_surface.alloc = testing.allocator;
+        core_surface.readonly = false;
+        core_surface.rt_app = &app;
+        core_surface.rt_surface = surface;
+        core_surface.config.mouse_shift_capture = .false;
+        core_surface.config.mouse_reporting = true;
+        core_surface.mouse = .{
+            .mods = .{ .ctrl = true, .shift = true },
+            .over_link = true,
+            .link_point = .{ .x = 1, .y = 0 },
+        };
+        core_surface.io.terminal = try terminal.Terminal.init(global.io(), testing.allocator, .{ .cols = 8, .rows = 2 });
+        defer core_surface.io.terminal.deinit(testing.allocator);
+        const term = &core_surface.io.terminal;
+        term.modes.set(.win32_input, true);
+        term.flags.mouse_event = .any;
+        term.flags.mouse_shift_capture = .false;
+        term.mouse_shape = .crosshair;
+        const screen = term.screens.active;
+        try screen.select(terminal.Selection.init(
+            screen.pages.pin(.{ .active = .{ .x = 0, .y = 0 } }).?,
+            screen.pages.pin(.{ .active = .{ .x = 3, .y = 0 } }).?,
+            false,
+        ));
+        const selection = screen.selection.?;
+
+        var mutex: std.Io.Mutex = .init;
+        core_surface.renderer_state = .{
+            .mutex = &mutex,
+            .terminal = term,
+            .mouse = .{ .mods = .{ .ctrl = true }, .point = .{ .x = 1, .y = 0 } },
+        };
+        core_surface.renderer_thread.wakeup = try global.xev.Async.init();
+        defer core_surface.renderer_thread.wakeup.deinit();
+        core_surface.io.mailbox = try termio.Mailbox.initSPSC(testing.allocator);
+        defer core_surface.io.mailbox.deinit(testing.allocator);
+        surface.current_cursor = w32.LoadCursorW(null, w32.IDC_HAND);
+
+        for (order) |release| {
+            var keys: [256]u8 = @splat(0);
+            if (release.remaining.ctrl) {
+                keys[w32.VK_CONTROL] = 0x80;
+                keys[w32.VK_LCONTROL] = 0x80;
+            }
+            if (release.remaining.shift) {
+                keys[w32.VK_SHIFT] = 0x80;
+                keys[w32.VK_LSHIFT] = 0x80;
+            }
+            if (Native.SetKeyboardState(&keys) == 0) return error.Win32Error;
+            const lparam: isize = (@as(isize, release.scancode) << 16) | 1;
+            surface.handleKeyEvent(release.vk, lparam, .release);
+
+            // No HWND is needed: losing the link must clear stale hover
+            // even when a stationary cursor's position cannot be queried.
+            try testing.expect(!core_surface.mouse.over_link);
+            try testing.expect(core_surface.mouse.link_point == null);
+            try testing.expect(core_surface.renderer_state.mouse.point == null);
+            try testing.expect(core_surface.mouse.mods.equal(release.remaining));
+            const cursor_id = if (release.remaining.shift) w32.IDC_IBEAM else w32.IDC_CROSS;
+            try testing.expectEqual(w32.LoadCursorW(null, cursor_id), surface.current_cursor);
+            try testing.expectEqualDeep(selection, screen.selection.?);
+
+            const msg = core_surface.io.mailbox.spsc.queue.pop(global.io()) orelse return error.ExpectedKeyRelease;
+            defer msg.deinit();
+            switch (msg) {
+                .write_small => |write| try testing.expectEqualStrings(release.expected_input, write.data[0..write.len]),
+                else => return error.UnexpectedInputMessage,
+            }
+            try testing.expect(core_surface.io.mailbox.spsc.queue.pop(global.io()) == null);
+        }
+    }
+}
+
+test "read-only blocks native keyboard character and IME input" {
+    const testing = std.testing;
+    const Native = struct {
+        extern "user32" fn SetKeyboardState(state: *const [256]u8) callconv(.winapi) i32;
+    };
+    var saved_keys: [256]u8 = undefined;
+    if (w32.GetKeyboardState(&saved_keys) == 0) return error.Win32Error;
+    defer _ = Native.SetKeyboardState(&saved_keys);
+    const keys: [256]u8 = @splat(0);
+    if (Native.SetKeyboardState(&keys) == 0) return error.Win32Error;
+
+    var core_app: @import("../../App.zig") = undefined;
+    core_app.alloc = testing.allocator;
+    var app: App = undefined;
+    app.core_app = &core_app;
+    const surface = try testing.allocator.create(Surface);
+    defer testing.allocator.destroy(surface);
+    surface.* = .{ .app = &app, .core_surface_ready = true };
+    const core_surface = &surface.core_surface;
+    core_surface.mouse = .{};
+    core_surface.io.terminal = try terminal.Terminal.init(global.io(), testing.allocator, .{ .cols = 8, .rows = 2 });
+    defer core_surface.io.terminal.deinit(testing.allocator);
+    core_surface.io.terminal.modes.set(.win32_input, true);
+    var mutex: std.Io.Mutex = .init;
+    core_surface.renderer_state.mutex = &mutex;
+    core_surface.io.mailbox = try termio.Mailbox.initSPSC(testing.allocator);
+    defer core_surface.io.mailbox.deinit(testing.allocator);
+
+    // Only this thread's keyboard state changes. The real native emitters
+    // run without an HWND, renderer, child process, or global input.
+    for ([_]bool{ true, false }) |readonly| {
+        core_surface.readonly = readonly;
+        surface.sendWin32InputEvent(w32.VK_RETURN, (28 << 16) | 1, .press);
+        surface.sendWin32InputEvent(w32.VK_RETURN, (28 << 16) | 1, .release);
+        surface.handleKeyEvent(w32.VK_CONTROL, (29 << 16) | 1, .press);
+        surface.handleKeyEvent(w32.VK_CONTROL, (29 << 16) | 1, .release);
+        surface.sendWin32CharEvent('x');
+        surface.sendImeText(&.{ 0x4E2D, 0xD83D, 0xDE00 });
+
+        const expected = [_][]const u8{
+            "\x1b[13;28;13;1;0;1_",  "\x1b[13;28;0;0;0;1_",
+            "\x1b[17;29;0;1;0;1_",   "\x1b[17;29;0;0;0;1_",
+            "\x1b[0;0;120;1;0;1_",   "\x1b[0;0;120;0;0;1_",
+            "\x1b[0;0;20013;1;0;1_", "\x1b[0;0;20013;0;0;1_",
+            "\x1b[0;0;55357;1;0;1_", "\x1b[0;0;55357;0;0;1_",
+            "\x1b[0;0;56832;1;0;1_", "\x1b[0;0;56832;0;0;1_",
+        };
+        if (!readonly) for (expected) |sequence| {
+            const msg = core_surface.io.mailbox.spsc.queue.pop(global.io()) orelse return error.ExpectedInput;
+            defer msg.deinit();
+            switch (msg) {
+                .write_small => |write| try testing.expectEqualStrings(sequence, write.data[0..write.len]),
+                else => return error.UnexpectedInput,
+            }
+        };
+        const extra = core_surface.io.mailbox.spsc.queue.pop(global.io());
+        defer if (extra) |msg| msg.deinit();
+        try testing.expect(extra == null);
+    }
 }

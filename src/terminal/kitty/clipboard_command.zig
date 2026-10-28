@@ -133,6 +133,18 @@ pub const Metadata = struct {
         return Operation.init(fields.op orelse return null);
     }
 
+    /// Responses carry a status key, including statuses added by future
+    /// versions of the protocol. Execution consumers must ignore them before
+    /// decoding request fields or replacing an in-flight write. Keep this
+    /// separate from parse so raw protocol consumers retain their existing API.
+    pub fn isResponse(raw: []const u8) bool {
+        var records = std.mem.splitScalar(u8, raw, ':');
+        while (records.next()) |record| {
+            if (std.mem.startsWith(u8, record, "status=")) return true;
+        }
+        return false;
+    }
+
     const Raw = struct {
         op: ?[]const u8 = null,
         loc: []const u8 = "",
@@ -271,6 +283,19 @@ pub const Payload = struct {
 /// type '.' excluded) is exempt from the user permission prompt.
 pub fn readPromptExempt(data_mimes: usize) bool {
     return data_mimes == 0;
+}
+
+test "protocol replies: clipboard status identifies responses without decoding" {
+    const testing = std.testing;
+    for ([_][]const u8{
+        "type=read:status=OK",     "type=read:status=DATA",           "type=read:status=DONE",
+        "type=write:status=EPERM", "type=write:status=",              "type=read:status=FUTURE",
+        "status=EPERM:type=write", "type=wdata:status=DATA:mime=!!!",
+    }) |raw| try testing.expect(Metadata.isResponse(raw));
+    for ([_][]const u8{
+        "type=read",            "type=write:future=option",    "type=wdata:mime=dGV4dC9wbGFpbg==",
+        "type=read:xstatus=OK", "type=read:name=c3RhdHVzPQ==",
+    }) |raw| try testing.expect(!Metadata.isResponse(raw));
 }
 
 test "metadata: empty is dropped" {

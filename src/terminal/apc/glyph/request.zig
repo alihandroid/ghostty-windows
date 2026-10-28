@@ -43,6 +43,26 @@ pub const CommandParser = struct {
         try self.data.appendSlice(self.alloc, bytes);
     }
 
+    /// Identify response-only fields before request parsing discards them.
+    /// Per the local protocol specification, support replies carry fmt and
+    /// query/register/clear replies carry status. A register request's fmt
+    /// and unrelated future request options remain valid.
+    pub fn isResponse(self: *const CommandParser) bool {
+        const raw = self.data.items;
+        if (raw.len < 2 or raw[1] != ';') return false;
+        const key = switch (raw[0]) {
+            's' => "fmt",
+            'q', 'r', 'c' => "status",
+            else => return false,
+        };
+        var fields = std.mem.splitScalar(u8, raw[2..], ';');
+        while (fields.next()) |field| {
+            const eql = std.mem.indexOfScalar(u8, field, '=') orelse continue;
+            if (std.mem.eql(u8, field[0..eql], key)) return true;
+        }
+        return false;
+    }
+
     /// Finish parsing and return an owned request that can outlive the parser.
     pub fn complete(self: *CommandParser, alloc: Allocator) Error!Request {
         // Normalize bare single-byte verbs like `s` into `s;` so the parsed

@@ -44,6 +44,16 @@ A file for [guiding coding agents](https://agents.md/).
   and is the target exercised by Windows CI.
 - Build a release with the same options plus `-Doptimize=fast`.
   Add `-Dwindows-console=true` when release-mode stderr/stdout is needed.
+- Agents must automatically refresh the **Ghostty Dev** desktop shortcut after
+  every successful local Windows application build. From WSL, use
+  `bash dist/windows/build-desktop.sh` (set `ZIG=/path/to/zig` when needed)
+  for normal builds; it builds and publishes the executable and matching
+  resources together. After a custom or native Windows build, run
+  `dist/windows/install-dev.ps1` through Windows PowerShell, setting `-BuildDir`
+  to the matching install prefix when it differs from `zig-out`. Complete this
+  step as part of the build workflow without asking the user to run it. Keep
+  existing terminal sessions running; the updated build takes effect on the
+  next launch.
 - Run the Windows compile and Zig tests with
   `zig build test -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu`.
 - From WSL, compile without running with `zig build test-build` and the same
@@ -70,7 +80,10 @@ A file for [guiding coding agents](https://agents.md/).
 ### Windows Resources and Packaging
 
 - Create the portable release ZIP with `bash dist/windows/package.sh`.
-- Keep `ghostty.exe` and the `share/` tree in the packaged relative layout.
+- Keep `ghostty.exe`, `conpty.dll`, and `OpenConsole.exe` together beside the
+  `share/` tree in the packaged relative layout. Copy both console runtime
+  files alongside staged Windows test executables too. The pinned Microsoft
+  backend avoids query/reply loops in the inbox Windows console host.
   `share/terminfo/ghostty.terminfo` is the resource-directory sentinel;
   omitting it causes bundled themes and shell integration discovery to fail.
 - The package script produces

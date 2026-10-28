@@ -2197,12 +2197,15 @@ fn surfaceWndProc(
         },
 
         w32.WM_DESTROY => {
-            // The child HWND is being destroyed (by Surface.deinit or
-            // parent Window destruction). Clear state so deinit()
-            // doesn't double-destroy. Lifecycle is managed by Window.
             _ = w32.SetWindowLongPtrW(hwnd, w32.GWLP_USERDATA, 0);
-            surface.hwnd = null;
-            surface.core_surface_ready = false;
+            if (is_surface_window) {
+                // Only terminal destruction ends the core surface's native
+                // lifetime. Its owned popups can be destroyed independently.
+                surface.hwnd = null;
+                surface.core_surface_ready = false;
+            } else {
+                surface.popupDestroyed(hwnd);
+            }
             return 0;
         },
 
@@ -2712,6 +2715,108 @@ test "tab overview popup routing rejects container userdata" {
     var surface: Surface = .{ .app = &app };
     _ = w32.SetWindowLongPtrW(terminal, w32.GWLP_USERDATA, @bitCast(@intFromPtr(&surface)));
     try std.testing.expectEqual(@as(?*Surface, &surface), app.popupSurface(edit));
+}
+
+test "detached tab keeps hidden popups and popup destruction preserves terminal" {
+    const testing = std.testing;
+    const Native = struct {
+        extern "user32" fn IsWindow(hwnd: w32.HWND) callconv(.winapi) i32;
+
+        fn create(class: [*:0]const u16, style: u32, parent: ?w32.HWND, instance: w32.HINSTANCE) !w32.HWND {
+            return w32.CreateWindowExW(0, class, std.unicode.utf8ToUtf16LeStringLiteral(""), style, 0, 0, 1, 1, parent, null, instance, null) orelse error.Win32Error;
+        }
+    };
+    const instance = w32.GetModuleHandleW(null) orelse return error.Win32Error;
+    const class = std.unicode.utf8ToUtf16LeStringLiteral("GhosttyDetachedPopupTest");
+    if (w32.RegisterClassExW(&.{
+        .cbSize = @sizeOf(w32.WNDCLASSEXW),
+        .style = 0,
+        .lpfnWndProc = &surfaceWndProc,
+        .cbClsExtra = 0,
+        .cbWndExtra = 0,
+        .hInstance = instance,
+        .hIcon = null,
+        .hCursor = null,
+        .hbrBackground = null,
+        .lpszMenuName = null,
+        .lpszClassName = class,
+        .hIconSm = null,
+    }) == 0) return error.Win32Error;
+    defer _ = w32.UnregisterClassW(class, instance);
+
+    var app: App = .{ .core_app = undefined, .config = undefined, .hinstance = instance };
+    const surface = try testing.allocator.create(Surface);
+    defer testing.allocator.destroy(surface);
+    surface.* = .{ .app = &app };
+    const static = std.unicode.utf8ToUtf16LeStringLiteral("STATIC");
+    const source = try Native.create(static, 0, null, instance);
+    var source_alive = true;
+    defer if (source_alive) {
+        _ = w32.DestroyWindow(source);
+    };
+    const destination = try Native.create(static, 0, null, instance);
+    defer _ = w32.DestroyWindow(destination);
+    const child = try Native.create(class, w32.WS_CHILD, source, instance);
+    const search = try Native.create(class, w32.WS_POPUP, source, instance);
+    const palette = try Native.create(class, w32.WS_POPUP, source, instance);
+    const preview = try Native.create(static, w32.WS_POPUP, source, instance);
+    surface.hwnd = child;
+    surface.search_hwnd = search;
+    surface.search_edit = try Native.create(std.unicode.utf8ToUtf16LeStringLiteral("EDIT"), w32.WS_CHILD, search, instance);
+    surface.search_count_label = try Native.create(static, w32.WS_CHILD, search, instance);
+    surface.palette_hwnd = palette;
+    surface.palette_edit = try Native.create(std.unicode.utf8ToUtf16LeStringLiteral("EDIT"), w32.WS_CHILD, palette, instance);
+    surface.link_preview_hwnd = preview;
+    for ([_]w32.HWND{ child, search, palette }) |hwnd| {
+        _ = w32.SetWindowLongPtrW(hwnd, w32.GWLP_USERDATA, @bitCast(@intFromPtr(surface)));
+    }
+    defer for ([_]w32.HWND{ child, search, palette }) |hwnd| {
+        if (Native.IsWindow(hwnd) != 0) _ = w32.SetWindowLongPtrW(hwnd, w32.GWLP_USERDATA, 0);
+    };
+
+    // Popups persist after dismissal. Exercise the production transfer on
+    // hidden real HWNDs, without a renderer, focus changes, or global input.
+    try surface.reparentNativeWindows(destination);
+    surface.core_surface_ready = true;
+    for ([_]w32.HWND{ search, palette, preview }) |hwnd| {
+        try testing.expectEqual(@as(i32, 0), w32.IsWindowVisible_(hwnd));
+        try testing.expectEqual(@as(isize, @bitCast(@intFromPtr(destination))), w32.GetWindowLongPtrW(hwnd, w32.GWLP_HWNDPARENT));
+    }
+    try testing.expect(w32.DestroyWindow(source) != 0);
+    source_alive = false;
+    for ([_]w32.HWND{ child, search, palette, preview }) |hwnd| {
+        try testing.expect(Native.IsWindow(hwnd) != 0);
+    }
+    try testing.expectEqual(@as(?w32.HWND, child), surface.hwnd);
+    try testing.expect(surface.core_surface_ready);
+
+    // Popup WM_DESTROY must clear only its own cached handles/state. The
+    // terminal remains usable, and a later open can create a new popup.
+    surface.search_active = true;
+    surface.search_total = 3;
+    surface.search_selected = 1;
+    try testing.expect(w32.DestroyWindow(search) != 0);
+    try testing.expect(surface.search_hwnd == null);
+    try testing.expect(surface.search_edit == null);
+    try testing.expect(surface.search_count_label == null);
+    try testing.expect(!surface.search_active);
+    try testing.expect(surface.search_total == null);
+    try testing.expect(surface.search_selected == null);
+    try testing.expectEqual(@as(?w32.HWND, palette), surface.palette_hwnd);
+    try testing.expectEqual(@as(?w32.HWND, child), surface.hwnd);
+    try testing.expect(surface.core_surface_ready);
+
+    surface.palette_active = true;
+    try testing.expect(w32.DestroyWindow(palette) != 0);
+    try testing.expect(surface.palette_hwnd == null);
+    try testing.expect(surface.palette_edit == null);
+    try testing.expect(!surface.palette_active);
+    try testing.expectEqual(@as(?w32.HWND, child), surface.hwnd);
+    try testing.expect(surface.core_surface_ready);
+
+    try testing.expect(w32.DestroyWindow(child) != 0);
+    try testing.expect(surface.hwnd == null);
+    try testing.expect(!surface.core_surface_ready);
 }
 
 test "export terminal IO requires a surface target" {
