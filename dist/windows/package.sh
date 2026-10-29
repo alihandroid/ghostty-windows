@@ -4,6 +4,7 @@
 # Usage:
 #   ./dist/windows/package.sh              # fast, x86_64
 #   ./dist/windows/package.sh debug        # Debug build (Console subsystem)
+#   ./dist/windows/package.sh --release    # exact, clean annotated win-vX.Y.Z
 #
 # Output: dist/windows/ghostty-windows-x64-<version>.zip
 
@@ -11,24 +12,78 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
-OPTIMIZE="${1:-fast}"
+OPTIMIZE=fast
+RELEASE=false
+for arg in "$@"; do
+    case "$arg" in
+        fast|debug|safe|small) OPTIMIZE="$arg" ;;
+        --release) RELEASE=true ;;
+        *) echo "Usage: bash dist/windows/package.sh [fast|debug|safe|small] [--release]" >&2; exit 2 ;;
+    esac
+done
 
 cd "$REPO_DIR"
+
+RELEASE_VERSION=""
+if [ "$RELEASE" = true ]; then
+    if [ "$OPTIMIZE" != fast ]; then
+        echo 'Release packages require fast optimization.' >&2
+        exit 1
+    fi
+    RELEASE_TAG="$(git describe --exact-match --tags --match 'win-v*' 2>/dev/null)" || {
+        echo 'Release packages require an exact annotated win-vX.Y.Z tag.' >&2
+        exit 1
+    }
+    if [[ ! "$RELEASE_TAG" =~ ^win-v[0-9]+\.[0-9]+\.[0-9]+$ ]] ||
+        [ "$(git cat-file -t "$RELEASE_TAG")" != tag ]; then
+        echo 'Release packages require an exact annotated win-vX.Y.Z tag.' >&2
+        exit 1
+    fi
+    if [ -n "$(git status --porcelain --untracked-files=normal)" ]; then
+        echo 'Release packages require a clean working tree.' >&2
+        exit 1
+    fi
+    RELEASE_VERSION="${RELEASE_TAG#win-v}"
+fi
+
+if ! command -v powershell.exe >/dev/null; then
+    echo 'Packaging requires Windows PowerShell to validate the executable and PE version resources.' >&2
+    exit 1
+fi
+windows_path() {
+    if command -v wslpath >/dev/null; then wslpath -w "$1"
+    elif command -v cygpath >/dev/null; then cygpath -w "$1"
+    else printf '%s\n' "$1"
+    fi
+}
 
 echo "Building ghostty (optimize=$OPTIMIZE)..."
 bash "$SCRIPT_DIR/build.sh" -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu -Doptimize="$OPTIMIZE"
 
-for resource in bin/ghostty.exe bin/conpty.dll bin/OpenConsole.exe share/terminfo/ghostty.terminfo share/licenses/conpty/LICENSE.txt; do
+for resource in bin/ghostty.exe bin/conpty.dll bin/OpenConsole.exe share/terminfo/ghostty.terminfo share/licenses/conpty/LICENSE.txt share/ghostty/shell-integration/powershell/ghostty-shell-integration.ps1; do
     if [ ! -f "zig-out/$resource" ]; then
         echo "ERROR: Incomplete Windows build — zig-out/$resource not found" >&2
         exit 1
     fi
 done
+for resource in share/ghostty/themes share/ghostty/shell-integration; do
+    if [ ! -d "zig-out/$resource" ] || [ -z "$(find "zig-out/$resource" -type f -print -quit)" ]; then
+        echo "ERROR: Incomplete Windows build — zig-out/$resource missing or empty" >&2
+        exit 1
+    fi
+done
 
-# Get version string
-VERSION="$(powershell.exe -Command "& '.\\zig-out\\bin\\ghostty.exe' --version" 2>/dev/null | head -1 | tr -d '\r' | awk '{print $2}')" || true
-if [ -z "$VERSION" ]; then
-    VERSION="$(git describe --tags --always 2>/dev/null || echo 'dev')"
+# Validate the built binary rather than guessing its version from nearby tags.
+VERIFY_SCRIPT="$(windows_path "$SCRIPT_DIR/verify-build.ps1")"
+VERSION="$(powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass \
+    -File "$VERIFY_SCRIPT" -BuildDir "$(windows_path "$REPO_DIR/zig-out")" | tr -d '\r')"
+if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.+-]+)?$ ]]; then
+    echo 'ERROR: Payload validation did not return a semantic executable version.' >&2
+    exit 1
+fi
+if [ "$RELEASE" = true ] && [ "$VERSION" != "$RELEASE_VERSION" ]; then
+    echo "ERROR: Executable version $VERSION does not match release tag $RELEASE_TAG." >&2
+    exit 1
 fi
 echo "Version: $VERSION"
 
@@ -36,6 +91,8 @@ echo "Version: $VERSION"
 STAGE_DIR="$REPO_DIR/dist/windows/_stage/ghostty"
 rm -rf "$REPO_DIR/dist/windows/_stage"
 mkdir -p "$STAGE_DIR"
+trap 'rm -rf "$REPO_DIR/dist/windows/_stage"' EXIT
+cp LICENSE "$STAGE_DIR/LICENSE"
 
 # Keep the matching console runtime pair beside the executable.
 for binary in ghostty.exe conpty.dll OpenConsole.exe; do
@@ -104,6 +161,11 @@ SHELL INTEGRATION (PowerShell)
 For full documentation: https://ghostty.org/docs
 READMEEOF
 echo "  README.txt"
+
+# Check the flattened portable layout as well as the build prefix.
+powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass \
+    -File "$VERIFY_SCRIPT" -BuildDir "$(windows_path "$STAGE_DIR")" \
+    -Portable -ExpectedVersion "$VERSION" >/dev/null
 
 # Create ZIP
 ZIP_NAME="ghostty-windows-x64-${VERSION}.zip"
