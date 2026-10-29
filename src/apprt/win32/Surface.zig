@@ -658,7 +658,13 @@ pub fn setVisible(self: *Surface, visible: bool) void {
 }
 
 pub fn close(self: *Surface, process_active: bool) void {
+    self.closeWithNative(process_active, w32);
+}
+
+fn closeWithNative(self: *Surface, process_active: bool, comptime native: type) void {
     log.debug("Surface.close called process_active={}", .{process_active});
+    const core_app = self.app.core_app;
+    const surface_id = self.core_surface.id;
     // If a shell command is still running, prompt the user before
     // closing. Without this, Ctrl+Shift+W silently kills the running
     // process — macOS shows the same kind of dialog for parity. We
@@ -667,7 +673,7 @@ pub fn close(self: *Surface, process_active: bool) void {
     // the core would return process_active=true unconditionally).
     if (process_active) {
         const parent_hwnd = self.parent_window.hwnd;
-        const result = w32.MessageBoxW(
+        const result = native.MessageBoxW(
             parent_hwnd,
             std.unicode.utf8ToUtf16LeStringLiteral(
                 "A process is still running in this terminal.\nClose anyway?",
@@ -681,9 +687,51 @@ pub fn close(self: *Surface, process_active: bool) void {
     // This avoids calling surface.deinit() from inside core_surface
     // callbacks (during tick), which causes reentrancy and crashes.
     // The WM_CLOSE handler in surfaceWndProc will call closeTab.
-    if (self.hwnd) |hwnd| {
-        _ = w32.PostMessageW(hwnd, w32.WM_CLOSE, 0, 0);
+    // A child can exit while the modal prompt pumps messages and free self.
+    // Resolve its identity again before touching any surface-owned state.
+    const core_surface = core_app.findSurfaceByID(surface_id) orelse return;
+    if (core_surface.rt_surface.hwnd) |hwnd| {
+        _ = native.PostMessageW(hwnd, w32.WM_CLOSE, 0, 0);
     }
+}
+
+test "Windows close confirmation tolerates child exit during the prompt" {
+    const testing = std.testing;
+    const Native = struct {
+        var core_app: *@import("../../App.zig") = undefined;
+        var surface: *Surface = undefined;
+        var posted = false;
+
+        fn MessageBoxW(_: ?w32.HWND, _: [*:0]const u16, _: [*:0]const u16, _: u32) i32 {
+            // Simulate the modal loop dispatching a child-exit callback that
+            // removes and frees the surface before the user confirms.
+            core_app.surfaces.clearRetainingCapacity();
+            std.testing.allocator.destroy(surface);
+            return w32.IDOK;
+        }
+
+        fn PostMessageW(_: w32.HWND, _: u32, _: usize, _: isize) i32 {
+            posted = true;
+            return 1;
+        }
+    };
+    var core_app: @import("../../App.zig") = undefined;
+    core_app.surfaces = .empty;
+    defer core_app.surfaces.deinit(testing.allocator);
+    var app: App = undefined;
+    app.core_app = &core_app;
+    var window: Window = undefined;
+    window.hwnd = @ptrFromInt(0x1000);
+    const surface = try testing.allocator.create(Surface);
+    surface.* = .{ .app = &app, .parent_window = &window, .hwnd = @ptrFromInt(0x2000) };
+    surface.core_surface.id = 1;
+    try core_app.surfaces.append(testing.allocator, surface);
+    Native.core_app = &core_app;
+    Native.surface = surface;
+    Native.posted = false;
+    surface.closeWithNative(true, Native);
+    try testing.expect(core_app.surfaces.items.len == 0);
+    try testing.expect(!Native.posted);
 }
 
 pub fn supportsClipboard(
@@ -729,6 +777,33 @@ test "normalize Windows clipboard newlines" {
     try std.testing.expectEqualStrings("one\ntwo\n\nthree\rfour\n", normalized);
 }
 
+/// CF_UNICODETEXT is supplied by another process. A malformed producer may
+/// omit the terminator; only inspect complete UTF-16 units within GlobalSize.
+fn boundedWindowsClipboardText(data: []align(@alignOf(u16)) const u8) ?[]const u16 {
+    if (data.len < @sizeOf(u16) or data.len % @sizeOf(u16) != 0) return null;
+    const text = std.mem.bytesAsSlice(u16, data);
+    const end = std.mem.indexOfScalar(u16, text, 0) orelse return null;
+    return text[0..end];
+}
+
+test "Windows clipboard read bounds malformed and Unicode text" {
+    const testing = std.testing;
+    const unterminated = [_]u16{ 'a', 'b' };
+    const bytes = std.mem.sliceAsBytes(&unterminated);
+    try testing.expect(boundedWindowsClipboardText(bytes) == null);
+    try testing.expect(boundedWindowsClipboardText(bytes[0..3]) == null);
+    try testing.expect(boundedWindowsClipboardText(bytes[0..1]) == null);
+    try testing.expect(boundedWindowsClipboardText(bytes[0..0]) == null);
+    const empty = [_]u16{0};
+    try testing.expectEqual(@as(usize, 0), boundedWindowsClipboardText(std.mem.sliceAsBytes(&empty)).?.len);
+
+    const unicode = std.unicode.utf8ToUtf16LeStringLiteral("one\r\n\u{4e2d}\u{1f600}");
+    const text = boundedWindowsClipboardText(std.mem.sliceAsBytes(unicode[0 .. unicode.len + 1])).?;
+    const utf8 = try std.unicode.utf16LeToUtf8Alloc(testing.allocator, text);
+    defer testing.allocator.free(utf8);
+    try testing.expectEqualStrings("one\n\u{4e2d}\u{1f600}", normalizeWindowsClipboardNewlines(utf8));
+}
+
 /// Show a modal clipboard confirmation dialog on the owning window and
 /// return true if the user approved. Mirrors the macOS/GTK clipboard
 /// confirmation flow so the core's paste-protection and OSC 52
@@ -759,6 +834,10 @@ pub fn clipboardRequest(
     // Kitty writes carry their committed representations in the request, so
     // they only need to pass through the core's authorization flow.
     if (state == .kitty_write) {
+        // CF_UNICODETEXT cannot preserve other MIME types or embedded NULs.
+        // Reject the entire transaction before changing the clipboard rather
+        // than acknowledge DONE after silently discarding representations.
+        if (!supportsKittyClipboardWrite(state.kitty_write.contents)) return .unsupported;
         return self.completeClipboardRequestWithConfirmation(
             state,
             &.{},
@@ -825,17 +904,18 @@ pub fn clipboardRequest(
 
         const hglobal = w32.GetClipboardData(w32.CF_UNICODETEXT) orelse
             return .unavailable;
+        const byte_size = w32.GlobalSize(hglobal);
+        if (byte_size == 0) return .unavailable;
         const ptr16 = w32.GlobalLock(hglobal) orelse {
             log.warn("GlobalLock failed", .{});
             return .unavailable;
         };
         defer _ = w32.GlobalUnlock(hglobal);
 
-        const wptr: [*]const u16 = @ptrCast(@alignCast(ptr16));
-        var wlen: usize = 0;
-        while (wptr[wlen] != 0) wlen += 1;
+        const text = boundedWindowsClipboardText(@alignCast(ptr16[0..byte_size])) orelse
+            return .unavailable;
 
-        const utf8 = std.unicode.utf16LeToUtf8Alloc(alloc, wptr[0..wlen]) catch |err| {
+        const utf8 = std.unicode.utf16LeToUtf8Alloc(alloc, text) catch |err| {
             log.warn("utf16LeToUtf8Alloc failed: {}", .{err});
             return .unavailable;
         };
@@ -851,8 +931,16 @@ pub fn clipboardRequest(
     return self.completeClipboardRequestWithConfirmation(
         state,
         &.{.{ .mime = "text/plain", .data = utf8z }},
-        &.{},
+        &.{"text/plain"},
     );
+}
+
+fn supportsKittyClipboardWrite(contents: []const apprt.ClipboardContent) bool {
+    for (contents) |content| {
+        if (!std.mem.eql(u8, content.mime, "text/plain")) return false;
+        if (std.mem.indexOfScalar(u8, content.data, 0) != null) return false;
+    }
+    return true;
 }
 
 /// Complete a structured clipboard request and run the native authorization
@@ -936,7 +1024,7 @@ pub fn setClipboard(
     confirm: bool,
 ) !void {
     // Only the standard clipboard is supported on Win32.
-    if (clipboard_type != .standard) return;
+    if (clipboard_type != .standard) return error.UnsupportedClipboard;
 
     // The confirm dialog below pumps messages and can free `self` (child
     // exit → surface close). Capture the App (stable for the process) and
@@ -958,11 +1046,15 @@ pub fn setClipboard(
         for (contents) |c| {
             if (std.mem.eql(u8, c.mime, "text/plain")) break :blk c.data;
         }
-        // No text/plain content; nothing to write.
-        return;
+        return error.UnsupportedClipboardFormat;
     };
+    if (std.mem.indexOfScalar(u8, text, 0) != null) return error.InvalidClipboardText;
 
     const alloc = app.core_app.alloc;
+    // A null owner followed by EmptyClipboard makes SetClipboardData fail.
+    // The App's message window survives surface destruction during a modal
+    // confirmation and gives the write a valid, stable clipboard owner.
+    const owner = app.msg_hwnd orelse return error.ClipboardUnavailable;
 
     // Convert UTF-8 to UTF-16LE.  Add 1 for the null terminator.
     const utf16 = try std.unicode.utf8ToUtf16LeAlloc(alloc, text);
@@ -974,13 +1066,13 @@ pub fn setClipboard(
     // Allocate a moveable global memory block.
     const hglobal = w32.GlobalAlloc(w32.GMEM_MOVEABLE, byte_size) orelse {
         log.warn("GlobalAlloc failed for clipboard write", .{});
-        return;
+        return error.OutOfMemory;
     };
 
     const dst_bytes = w32.GlobalLock(hglobal) orelse {
         log.warn("GlobalLock failed for clipboard write", .{});
         _ = w32.GlobalFree(hglobal);
-        return;
+        return error.ClipboardWriteFailed;
     };
 
     // Copy the UTF-16LE data (including null terminator) into the block.
@@ -990,21 +1082,96 @@ pub fn setClipboard(
 
     _ = w32.GlobalUnlock(hglobal);
 
-    // null owner: the write is not tied to the (possibly freed) surface hwnd.
-    if (w32.OpenClipboard(null) == 0) {
-        log.warn("OpenClipboard failed for clipboard write", .{});
-        _ = w32.GlobalFree(hglobal);
-        return;
-    }
-    defer _ = w32.CloseClipboard();
+    try publishTextClipboard(w32, owner, hglobal);
+}
 
-    _ = w32.EmptyClipboard();
+/// Transfer an allocated text handle to the system. On failure the caller's
+/// allocation is freed and the error reaches the protocol completion, which
+/// must send EIO instead of reporting a successful Kitty clipboard commit.
+fn publishTextClipboard(comptime native: type, owner: w32.HWND, hglobal: *anyopaque) !void {
+    errdefer _ = native.GlobalFree(hglobal);
+    if (native.OpenClipboard(owner) == 0) return error.ClipboardUnavailable;
+    defer _ = native.CloseClipboard();
+    if (native.EmptyClipboard() == 0) return error.ClipboardWriteFailed;
+    // SetClipboardData owns hglobal only on success.
+    if (native.SetClipboardData(w32.CF_UNICODETEXT, hglobal) == null)
+        return error.ClipboardWriteFailed;
+}
 
-    // SetClipboardData takes ownership of hglobal on success.
-    if (w32.SetClipboardData(w32.CF_UNICODETEXT, hglobal) == null) {
-        log.warn("SetClipboardData failed", .{});
-        _ = w32.GlobalFree(hglobal);
+test "Windows clipboard write ownership and failure propagation" {
+    // Exercise resource transfer and failures without reading or replacing
+    // the user's system clipboard, even on a shared working desktop.
+    const Native = struct {
+        var fail_at: u8 = 0;
+        var calls: u8 = 0;
+        var freed = false;
+        var closed = false;
+        var received_owner: ?w32.HWND = null;
+
+        fn OpenClipboard(owner: ?w32.HWND) i32 {
+            received_owner = owner;
+            calls += 1;
+            return if (fail_at == 1) 0 else 1;
+        }
+
+        fn CloseClipboard() i32 {
+            closed = true;
+            return 1;
+        }
+
+        fn EmptyClipboard() i32 {
+            calls += 1;
+            return if (fail_at == 2) 0 else 1;
+        }
+
+        fn SetClipboardData(format: u32, handle: *anyopaque) ?*anyopaque {
+            std.debug.assert(format == w32.CF_UNICODETEXT);
+            calls += 1;
+            return if (fail_at == 3) null else handle;
+        }
+
+        fn GlobalFree(_: *anyopaque) ?*anyopaque {
+            freed = true;
+            return null;
+        }
+    };
+    const owner: w32.HWND = @ptrFromInt(0x1000);
+    const handle: *anyopaque = @ptrFromInt(0x2000);
+    for (0..4) |failure| {
+        Native.fail_at = @intCast(failure);
+        Native.calls = 0;
+        Native.freed = false;
+        Native.closed = false;
+        Native.received_owner = null;
+        const result = publishTextClipboard(Native, owner, handle);
+        switch (failure) {
+            0 => try result,
+            1 => try std.testing.expectError(error.ClipboardUnavailable, result),
+            2, 3 => try std.testing.expectError(error.ClipboardWriteFailed, result),
+            else => unreachable,
+        }
+        try std.testing.expectEqual(owner, Native.received_owner.?);
+        try std.testing.expectEqual(if (failure == 0) 3 else @as(u8, @intCast(failure)), Native.calls);
+        try std.testing.expectEqual(failure != 0, Native.freed);
+        try std.testing.expectEqual(failure != 1, Native.closed);
     }
+}
+
+test "Windows clipboard rejects unsupported Kitty commits before native access" {
+    const unsupported = [_][]const apprt.ClipboardContent{
+        &.{.{ .mime = "image/png", .data = "png" }},
+        &.{ .{ .mime = "text/plain", .data = "text" }, .{ .mime = "text/html", .data = "<b>text</b>" } },
+        &.{.{ .mime = "text/plain", .data = "before\x00after" }},
+    };
+    // These requests must not access an HWND, the App, or a core surface.
+    var surface: Surface = .{ .app = undefined };
+    for (unsupported) |contents| {
+        var request: apprt.ClipboardRequest.KittyWrite = undefined;
+        request.contents = contents;
+        try std.testing.expectEqual(apprt.ClipboardReadResult.unsupported, try surface.clipboardRequest(.standard, .{ .kitty_write = &request }));
+    }
+    try std.testing.expect(supportsKittyClipboardWrite(&.{}));
+    try std.testing.expect(supportsKittyClipboardWrite(&.{.{ .mime = "text/plain", .data = "Unicode: \u{4e2d}\u{1f600}" }}));
 }
 
 pub fn defaultTermioEnv(self: *const Surface) !std.process.Environ.Map {
