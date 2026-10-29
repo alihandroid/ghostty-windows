@@ -30,6 +30,9 @@ The README compatibility table and roadmap track the remaining gaps.
 
 ### Windows Fixes and Adaptations
 
+- Restyle the standalone tab strip with equal-width tabs, centered Segoe UI
+  titles, theme-derived selection colors, and right-side hover close buttons.
+  Keep the native Windows caption and separate tab row.
 - Use the stable application window as clipboard owner, propagate native
   write failures, and reject unsupported Kitty clipboard representations
   instead of acknowledging data that was not written.
@@ -94,6 +97,8 @@ The README compatibility table and roadmap track the remaining gaps.
 
 ### Testing and Development
 
+- Add an HWND-scoped tab-strip regression covering opaque, translucent, and
+  light windows without desktop-global input.
 - Require a clean annotated `win-vX.Y.Z` tag for production packages. Validate
   the executable version, all PE version fields, required resources, and the
   flattened portable layout; include the project MIT license in the ZIP.
