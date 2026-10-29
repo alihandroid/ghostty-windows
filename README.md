@@ -130,8 +130,8 @@ Requires [Zig](https://ziglang.org/download/) 0.17.0.
 
 ### Native build on Windows (recommended)
 
-```bash
-zig build -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu
+```powershell
+.\dist\windows\build.ps1 -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu
 ```
 
 The executable is at `zig-out/bin/ghostty.exe`. Building with the native
@@ -150,22 +150,17 @@ but still allows it to be renamed.
 
 ### Cross-compile from Linux/WSL2
 
-The same command works from Linux with the GNU ABI target
+Use `bash dist/windows/build.sh -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu`
+from Linux with the GNU ABI target
 (`x86_64-windows-gnu` — the plain `x86_64-windows` target selects the MSVC
 ABI, which cannot cross-compile from Linux because it lacks the MSVC
 headers).
 
-If a WSL build fails with `AccessDenied` while probing an unreadable Windows
-`PATH` entry, use a Linux-only `PATH` for that build command:
-
-```bash
-ghostty_build_path="$(printf '%s' "$PATH" | tr ':' '\n' | awk '!/^\/mnt\/[A-Za-z]\//' | paste -sd: -)"
-PATH="$ghostty_build_path" zig build -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu
-```
-
-This leaves the calling shell's `PATH` unchanged so `powershell.exe`, `cmd.exe`,
-and other Windows test tools remain available. Zig 0.17.0 must be on the Linux
-build path. Cross-compiling is not the same as running the native tests: use
+The wrapper excludes unreadable Windows `PATH` entries from Zig's compiler
+probes while leaving the calling shell's `PATH` unchanged, so `powershell.exe`,
+`cmd.exe`, and other Windows test tools remain available. It prefers the pinned
+Zig version under `~/.local/zig-versions`; set `ZIG` to select another compiler.
+Cross-compiling is not the same as running the native tests: use
 `test-build` to compile them, then run from a local Windows directory with their
 fixtures as described under [Testing](#testing).
 
@@ -195,10 +190,38 @@ To publish an existing `zig-out` build from Windows PowerShell instead:
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File dist/windows/install-dev.ps1
 ```
 
+### Build cache
+
+The desktop and packaging scripts automatically prune stale cache entries
+before building. For other builds and tests, use `bash dist/windows/build.sh`
+on Linux/WSL or `.\dist\windows\build.ps1` on Windows, followed by the usual
+`zig build` arguments (for example, `test-build -Dtest-filter=Screen`).
+
+Pruning retains entries accessed or modified within 30 days, the newest producer
+of each artifact name, and all cache entries referenced by those roots. It
+understands both object and build-configuration manifest outputs, so retained
+metadata cannot refer to deleted artifacts. Downloaded packages, compiler IR
+caches, temporary files, and installed development builds stay available.
+
+The wrapper holds `.zig-cache.lock` through pruning and the complete build.
+Other wrappers wait for that lock. A wrapped `run` holds it until the launched
+app exits; use the desktop shortcut for sessions that stay open during later
+builds. Pruning is deferred when another Zig process
+is running or metadata cannot be interpreted. Use the wrappers for concurrent
+development; direct Zig invocations do not participate in this lock. Custom
+cache directories selected with `--cache-dir` or `ZIG_LOCAL_CACHE_DIR` are
+measured but left untouched because they may be shared with other projects.
+
+Regular `zig build` commands also run a native size check, including cached
+builds, and warn above 20 GiB. This is a warning threshold rather than a hard cap:
+recent and referenced artifacts are retained even above the threshold. Prefer
+a consistent Zig version and optimization mode and use `-Dtest-filter` for
+focused tests to limit compiled variants.
+
 ### Release build
 
 ```bash
-zig build -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu -Doptimize=fast
+bash dist/windows/build.sh -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu -Doptimize=fast
 ```
 
 To debug a release build with stderr visible, add `-Dwindows-console=true`
@@ -416,15 +439,15 @@ src/shell-integration/powershell/
 From a local Windows checkout:
 
 ```powershell
-zig build test -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu
+.\dist\windows\build.ps1 test -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu
 # Prefer a filter for focused changes:
-zig build test -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu -Dtest-filter="program resize"
+.\dist\windows\build.ps1 test -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu -Dtest-filter="program resize"
 ```
 
 From WSL, compile without executing the Windows test runner:
 
 ```bash
-zig build test-build -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu -Demit-test-exe=true
+bash dist/windows/build.sh test-build -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu -Demit-test-exe=true
 ```
 
 Add `-Dtest-filter="program resize"` or `-Dtest-filter="tab overview"` to compile

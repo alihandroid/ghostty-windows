@@ -92,14 +92,23 @@ jobs:
           }
 
       - name: Test
-        run: zig build test -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu
+        run: .\dist\windows\build.ps1 test -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu
 
       # Full app build, which also compiles dist/windows/ghostty.rc.
       - name: Build
-        run: zig build -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu
+        run: .\dist\windows\build.ps1 -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu
 
       - name: Build stripped release
-        run: zig build -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu -Doptimize=fast
+        run: .\dist\windows\build.ps1 -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu -Doptimize=fast
+
+      - name: Test cache maintenance helpers
+        run: |
+          zig test src/build/cache_guard.zig -target x86_64-windows-gnu
+          if ($LASTEXITCODE -ne 0) { throw 'Cache guard tests failed' }
+          zig test src/build/cache_prune.zig -target x86_64-windows-gnu
+          if ($LASTEXITCODE -ne 0) { throw 'Cache pruning tests failed' }
+          python test/win32/test_cache_maintenance.py
+          if ($LASTEXITCODE -ne 0) { throw 'Cache maintenance integration tests failed' }
 
   fmt:
     name: zig fmt
@@ -113,6 +122,12 @@ jobs:
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: 0.17.0
+
+      - name: Test cache maintenance
+        run: |
+          zig test src/build/cache_guard.zig
+          zig test src/build/cache_prune.zig
+          python3 test/win32/test_cache_maintenance.py
 
       - name: zig fmt
         run: zig fmt --check .

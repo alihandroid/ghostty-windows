@@ -23,19 +23,7 @@ if ! command -v powershell.exe >/dev/null || ! command -v wslpath >/dev/null; th
     exit 1
 fi
 
-# Honor an explicit compiler, otherwise prefer the required version in a local
-# versioned installation before falling back to PATH.
-ZIG_BIN="${ZIG:-zig}"
-if [ -z "${ZIG:-}" ]; then
-    REQUIRED_ZIG="$(sed -n 's/.*minimum_zig_version = "\([^"]*\)".*/\1/p' build.zig.zon)"
-    LOCAL_ZIG="$HOME/.local/zig-versions/zig-$(uname -m)-linux-$REQUIRED_ZIG/zig"
-    if [ -x "$LOCAL_ZIG" ]; then ZIG_BIN="$LOCAL_ZIG"; fi
-fi
-
-# Ignore unreadable Windows PATH entries during Zig's compiler probes. Keep
-# the original PATH for Windows interop after the build finishes.
-BUILD_PATH="$(printf '%s' "$PATH" | tr ':' '\n' | awk '!/^\/mnt\/[A-Za-z]\//' | paste -sd: -)"
-PATH="$BUILD_PATH" "$ZIG_BIN" build \
+bash "$SCRIPT_DIR/build.sh" \
     -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu -Doptimize="$OPTIMIZE"
 
 powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass \

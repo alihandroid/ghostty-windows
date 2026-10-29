@@ -431,6 +431,37 @@ pub fn build(b: *std.Build) !void {
     } else {
         _ = b.addFail("cannot update translations when i18n is disabled");
     }
+
+    // This must be a make-time step: Zig can reuse the configured build graph
+    // without calling build() again. Share one run across the development steps
+    // so selecting multiple steps still checks the local cache only once.
+    if (!config.is_dep) {
+        const cache_check = b.addExecutable(.{
+            .name = "ghostty-cache-check",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/build/cache_check.zig"),
+                .target = b.graph.host,
+                .optimize = .fast,
+                .strip = true,
+            }),
+        });
+        const cache_check_run = b.addRunArtifact(cache_check);
+        cache_check_run.has_side_effects = true;
+        cache_check_run.addDirectoryArg2(std.Build.LazyPath.cache_root, .{});
+        cache_check_run.setCwd(b.path(""));
+
+        for ([_]*std.Build.Step{
+            b.getInstallStep(),
+            run_step,
+            run_valgrind_step,
+            test_step,
+            test_build_step,
+            test_lib_vt_step,
+            test_lib_vt_build_step,
+            test_lib_vt_schema_step,
+            test_valgrind_step,
+        }) |step| step.dependOn(&cache_check_run.step);
+    }
 }
 
 fn addGhosttyH(

@@ -44,6 +44,12 @@ A file for [guiding coding agents](https://agents.md/).
   and is the target exercised by Windows CI.
 - Build a release with the same options plus `-Doptimize=fast`.
   Add `-Dwindows-console=true` when release-mode stderr/stdout is needed.
+- Run development builds and Zig test commands through
+  `bash dist/windows/build.sh` on Linux/WSL or `dist/windows/build.ps1` on
+  Windows, followed by the usual `zig build` arguments. These wrappers prune
+  stale cache entries before compiling and hold the cache guard through the
+  build. The desktop and packaging helpers use them automatically. Direct
+  `zig build` still checks cache size but does not prune during compilation.
 - Agents must automatically refresh the **Ghostty Dev** desktop shortcut after
   every successful local Windows application build. From WSL, use
   `bash dist/windows/build-desktop.sh` (set `ZIG=/path/to/zig` when needed)

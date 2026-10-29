@@ -16,7 +16,7 @@ OPTIMIZE="${1:-fast}"
 cd "$REPO_DIR"
 
 echo "Building ghostty (optimize=$OPTIMIZE)..."
-zig build -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu -Doptimize="$OPTIMIZE"
+bash "$SCRIPT_DIR/build.sh" -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu -Doptimize="$OPTIMIZE"
 
 for resource in bin/ghostty.exe bin/conpty.dll bin/OpenConsole.exe share/terminfo/ghostty.terminfo share/licenses/conpty/LICENSE.txt; do
     if [ ! -f "zig-out/$resource" ]; then
