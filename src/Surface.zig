@@ -5088,6 +5088,12 @@ pub fn cursorPosCallback(
             },
         }
 
+        // A double-click that hasn't left its original cell keeps the
+        // selection made on press. Recomputing it here would replace a
+        // whole-URL selection with the plain word (e.g. dropping "https:").
+        if (self.mouse.selection_gesture.left_click_count == 2 and
+            !self.mouse.selection_gesture.left_click_dragged) break :select;
+
         // Update our selection based on the gesture state
         try self.setSelection(drag_selection);
     }
