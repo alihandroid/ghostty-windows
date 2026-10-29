@@ -1783,7 +1783,7 @@ fn keyToVk(key: @import("../../input/key.zig").Key) ?u32 {
 // -----------------------------------------------------------------------
 
 /// GitHub releases API URL for this fork.
-const UPDATE_URL = "https://api.github.com/repos/InsipidPoint/ghostty-windows/releases/latest";
+const UPDATE_URL = "https://api.github.com/repos/shiweis/ghostty-windows/releases/latest";
 
 /// Custom message posted from the update thread to the message loop.
 const WM_APP_UPDATE_AVAILABLE: u32 = w32.WM_APP + 2;
@@ -1793,7 +1793,7 @@ const WM_APP_UPDATE_AVAILABLE: u32 = w32.WM_APP + 2;
 const WM_APP_TRAY: u32 = w32.WM_APP + 3;
 
 /// User-facing GitHub releases page that the update balloon links to.
-const RELEASES_URL = "https://github.com/InsipidPoint/ghostty-windows/releases/latest";
+const RELEASES_URL = "https://github.com/shiweis/ghostty-windows/releases/latest";
 
 /// Tray icon and timer IDs for notifications. Distinct IDs mean the
 /// desktop and update balloons can coexist without one's auto-cleanup
