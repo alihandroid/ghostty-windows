@@ -671,16 +671,24 @@ pub fn closeSplitSurface(self: *Window, surface: *Surface) void {
     }
 }
 
-/// Switch to the tab at the given index.
-/// Set the visibility (occlusion) of every surface in the active tab. Used on
-/// window minimize/restore so the renderer stops rebuilding frames while the
-/// window is minimized.
-fn setActiveTabVisible(self: *Window, visible: bool) void {
-    if (self.active_tab >= self.tab_count) return;
-    var it = self.tab_trees[self.active_tab].iterator();
-    while (it.next()) |entry| entry.view.setVisible(visible);
+/// Whether the top-level window can display its active tab. A layout pass can
+/// run while hidden (quick terminal, toggle_visibility) or minimized.
+fn isVisible(self: *const Window) bool {
+    const hwnd = self.hwnd orelse return false;
+    return w32.IsWindowVisible_(hwnd) != 0 and w32.IsIconic(hwnd) == 0;
 }
 
+/// Publish parent visibility without exposing panes hidden by split zoom.
+fn setActiveTabVisible(self: *Window, visible: bool) void {
+    if (self.active_tab >= self.tab_count) return;
+    const tree = self.tab_trees[self.active_tab];
+    var it = tree.iterator();
+    while (it.next()) |entry| {
+        entry.view.setVisible(visible and (tree.zoomed == null or entry.handle == tree.zoomed.?));
+    }
+}
+
+/// Switch to the tab at the given index.
 pub fn selectTabIndex(self: *Window, idx: usize) void {
     if (idx >= self.tab_count) return;
     self.cancelTabRename();
@@ -718,7 +726,7 @@ pub fn layoutSplits(self: *Window) void {
         var it = tree.iterator();
         while (it.next()) |entry| {
             if (entry.handle == zoomed_handle) {
-                entry.view.setVisible(true);
+                entry.view.setVisible(self.isVisible());
                 if (entry.view.hwnd) |h| {
                     const w = @max(rect.right - rect.left, 1);
                     const ht = @max(rect.bottom - rect.top, 1);
@@ -749,7 +757,7 @@ fn layoutNode(self: *Window, tree: SplitTree(Surface), handle: SplitTree(Surface
     if (handle.idx() >= tree.nodes.len) return;
     switch (tree.nodes[handle.idx()]) {
         .leaf => |view| {
-            view.setVisible(true);
+            view.setVisible(self.isVisible());
             if (view.hwnd) |h| {
                 const w = @max(rect.right - rect.left, 1);
                 const ht = @max(rect.bottom - rect.top, 1);
@@ -2374,6 +2382,14 @@ pub fn windowWndProc(
             return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
         },
 
+        w32.WM_SHOWWINDOW => {
+            // ShowWindow sends this before updating WS_VISIBLE, so use its
+            // new state rather than querying the old native style. This also
+            // covers quick-terminal animation completion and app hide/show.
+            window.setActiveTabVisible(wparam != 0 and w32.IsIconic(hwnd) == 0);
+            return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
+        },
+
         w32.WM_SIZE => {
             // Minimizing does not hide child surface HWNDs, so tell the core
             // to stop rendering the active tab while minimized. Return early:
@@ -2385,7 +2401,7 @@ pub fn windowWndProc(
                 return 0;
             }
             if (wparam == w32.SIZE_RESTORED or wparam == w32.SIZE_MAXIMIZED) {
-                window.setActiveTabVisible(true);
+                window.setActiveTabVisible(window.isVisible());
             }
             window.handleResize();
             return 0;
