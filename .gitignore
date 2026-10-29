@@ -9,6 +9,8 @@
 .flatpak-builder/
 zig-cache/
 .zig-cache/
+.zig-cache-maintenance/
+.zig-cache.lock
 zig-pkg/
 zig-out/
 zig-pkg/

@@ -130,8 +130,10 @@ pub const StreamHandler = struct {
         self.terminal.setDefaultCursorBlink(config.cursor_blink);
         self.terminal.setDefaultXtChecksum(config.xt_checksum_extension);
 
-        // The config could have changed any of our colors so update mode 2031
-        self.messageWriter(.{ .color_scheme_report = .{ .force = false } });
+        // The config could have changed any of our colors, but the mode
+        // 2031 report is sent by Termio.changeConfig. This runs on the io
+        // thread, which is the only reader of the termio mailbox, so
+        // sending to it here would deadlock if the mailbox were full.
     }
 
     inline fn surfaceMessageWriter(
@@ -374,7 +376,7 @@ pub const StreamHandler = struct {
             .dcs_put => try self.dcsPut(value),
             .dcs_unhook => try self.dcsUnhook(),
             .apc_start => self.apc.start(),
-            .apc_end => try self.apcEnd(),
+            .apc_end => try self.apcEnd(value.terminated),
             .apc_put => self.apc.feed(self.alloc, value),
             .apc_put_slice => self.apc.feedSlice(self.alloc, value.bytes),
             .kitty_clipboard => try self.kittyClipboard(value),
@@ -504,9 +506,14 @@ pub const StreamHandler = struct {
         }
     }
 
-    pub fn apcEnd(self: *StreamHandler) !void {
+    pub fn apcEnd(self: *StreamHandler, terminated: bool) !void {
         var result = self.apc.endRequest() orelse return;
         defer result.deinit(self.alloc);
+
+        // CAN, SUB, or a new control sequence aborts the APC. Finalize the
+        // parser to release its allocations, but only execute commands that
+        // ended with a string terminator, as in the libghostty-vt handler.
+        if (!terminated) return;
 
         // log.warn("APC command: {}", .{result});
         switch (result) {
@@ -1949,6 +1956,91 @@ pub const StreamHandler = struct {
         self.surfaceMessageWriter(.{ .progress_report = report });
     }
 };
+
+test "app stream: cancelled or aborted APC commands have no effects" {
+    const testing = std.testing;
+    if (comptime !terminal.options.kitty_graphics or
+        !terminal.options.glyph_protocol) return error.SkipZigTest;
+
+    const cases = [_]struct {
+        request: []const u8,
+        kind: enum { kitty, glyph },
+    }{
+        .{
+            .request = "\x1b_Ga=t,f=24,s=1,v=1,i=7,q=2;AAAA",
+            .kind = .kitty,
+        },
+        .{
+            .request = "\x1b_25a1;r;cp=e0a0;reply=0;AAAAAAAAAAAAAA==",
+            .kind = .glyph,
+        },
+    };
+    for (cases) |case| {
+        // CAN and SUB cancel the string. An 8-bit CSI aborts it and
+        // starts a new sequence, which the next ESC can safely replace.
+        for ([_][]const u8{ "\x18", "\x1a", "\x9b" }) |ending| {
+            const input = try std.mem.concat(testing.allocator, u8, &.{ case.request, ending });
+            defer testing.allocator.free(input);
+
+            // Exercise both bulk processing and every read boundary.
+            for (0..input.len + 1) |split| {
+                var t = try terminal.Terminal.init(testing.io, testing.allocator, .{
+                    .cols = 10,
+                    .rows = 10,
+                });
+                defer t.deinit(testing.allocator);
+
+                var mailbox = try termio.Mailbox.initSPSC(testing.allocator);
+                defer mailbox.deinit(testing.allocator);
+                var wakeup = try xev.Async.init();
+                defer wakeup.deinit();
+                var mutex: std.Io.Mutex = .init;
+                mutex.lockUncancelable(global.io());
+                defer mutex.unlock(global.io());
+                var renderer_state: renderer.State = .{
+                    .mutex = &mutex,
+                    .terminal = &t,
+                };
+
+                var stream: StreamHandler.Stream = .init(.{
+                    .allocator = testing.allocator,
+                    .handler = .{
+                        .alloc = testing.allocator,
+                        .terminal = &t,
+                        .termio_mailbox = &mailbox,
+                        .renderer_state = &renderer_state,
+                        .renderer_wakeup = &wakeup,
+                        .size = undefined,
+                        .surface_mailbox = undefined,
+                        .renderer_mailbox = undefined,
+                        .enquiry_response = "",
+                        .osc_color_report_format = .none,
+                        .clipboard_write = .deny,
+                        .clipboard_write_limit = 0,
+                        .xt_checksum_report = false,
+                    },
+                });
+                defer stream.deinit();
+
+                stream.nextSlice(input[0..split]);
+                stream.nextSlice(input[split..]);
+                try testing.expect(t.screens.active.kitty_images.imageById(7) == null);
+                try testing.expect(!t.glyph_glossary.contains(0xE0A0));
+                try testing.expect(!stream.handler.termio_messaged);
+                try testing.expect(mailbox.spsc.queue.pop(global.io()) == null);
+
+                // Cancellation must also reset the collector, allowing the
+                // next complete command to work normally.
+                stream.nextSlice(case.request);
+                stream.nextSlice("\x1b\\");
+                switch (case.kind) {
+                    .kitty => try testing.expect(t.screens.active.kitty_images.imageById(7) != null),
+                    .glyph => try testing.expect(t.glyph_glossary.contains(0xE0A0)),
+                }
+            }
+        }
+    }
+}
 
 test "kitty clipboard read: targets-only never consumes a one-time grant" {
     const testing = std.testing;
