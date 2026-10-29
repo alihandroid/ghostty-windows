@@ -47,14 +47,17 @@ function prompt {
     }
 
     # OSC 7 — report current working directory.
-    $cwd = (Get-Location).Path -replace '\\', '/'
+    # A provider or PSDrive name can contain control characters even when a
+    # Windows filesystem path cannot. Keep those bytes out of OSC payloads so
+    # navigating to such a location cannot inject terminal commands.
+    $cwd = (Get-Location).Path -replace '\\', '/' -replace '\p{Cc}', ''
     # File URI: file://hostname/path
-    $hostname = [System.Net.Dns]::GetHostName()
+    $hostname = [System.Net.Dns]::GetHostName() -replace '\p{Cc}', ''
     [Console]::Write("$Script:__ghostty_escape]7;file://$hostname/$cwd`a")
 
     # OSC 2 — window title (current directory).
     if ($GhosttyFeatures -contains 'title') {
-        $leaf = Split-Path -Leaf (Get-Location)
+        $leaf = (Split-Path -Leaf (Get-Location)) -replace '\p{Cc}', ''
         [Console]::Write("$Script:__ghostty_escape]2;$leaf`a")
     }
 

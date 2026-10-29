@@ -492,7 +492,10 @@ fn parseDestination(alloc: Allocator, stdout: []const u8) ?[]const u8 {
     var host: []const u8 = "";
     var port: []const u8 = "";
     var it = std.mem.tokenizeScalar(u8, stdout, '\n');
-    while (it.next()) |line| {
+    while (it.next()) |raw_line| {
+        // Native Windows OpenSSH emits CRLF even when stdout is a pipe.
+        // Keep line endings out of host/user/port and their cache key.
+        const line = std.mem.trimEnd(u8, raw_line, "\r");
         const space = std.mem.indexOfScalar(u8, line, ' ') orelse continue;
         const key = line[0..space];
         const value = line[space + 1 ..];
@@ -526,8 +529,8 @@ fn parseDestination(alloc: Allocator, stdout: []const u8) ?[]const u8 {
 }
 
 /// Install Ghostty's terminfo on the remote host over a short-lived SSH
-/// ControlMaster connection. The master tears down with the client
-/// (`ControlPersist=no`) so no socket lingers.
+/// connection. POSIX uses a scoped ControlMaster (`ControlPersist=no`);
+/// native Windows OpenSSH does not support client multiplexing.
 fn installRemoteTerminfo(
     alloc: Allocator,
     opts: *const Options,
@@ -538,15 +541,16 @@ fn installRemoteTerminfo(
     try terminfopkg.ghostty.encode(&buf.writer);
     const terminfo = buf.written();
 
-    // ControlPath is in TMPDIR with a short, random basename. ssh uses
-    // ControlPath as the bind address for a Unix domain socket; macOS
-    // limits sockaddr_un.sun_path to ~104 bytes, so keeping the path
-    // short leaves margin.
-    const control_path = try internal_os.randomTmpPath(alloc, "ghostty-ssh-");
-    const control_path_opt = try alloc.print(
-        "ControlPath={s}",
-        .{control_path},
-    );
+    // ControlPath names a Unix domain socket. Keep it short for macOS's
+    // sockaddr_un limit and omit it entirely for native Windows OpenSSH.
+    const control_path_opt: ?[]const u8 = if (builtin.target.os.tag == .windows)
+        null
+    else path: {
+        const control_path = try internal_os.randomTmpPath(alloc, "ghostty-ssh-");
+        defer alloc.free(control_path);
+        break :path try alloc.print("ControlPath={s}", .{control_path});
+    };
+    defer if (control_path_opt) |path| alloc.free(path);
 
     // Under --verbose, let remote stderr through (the `tic` step is
     // the most common failure source) and inherit ssh's stderr so it
@@ -561,20 +565,15 @@ fn installRemoteTerminfo(
         \\exit 1
     ;
 
-    // Set up an SSH ControlMaster scoped to this single install:
-    //   - ControlMaster=yes makes our client also act as the master.
-    //   - ControlPersist=no tears the master down when our client
-    //     exits; no socket lingers on the remote side.
-    const argv = try std.mem.concat(alloc, []const u8, &.{
-        &.{opts.ssh},
-        &.{
-            "-o", "ControlMaster=yes",
-            "-o", "ControlPersist=no",
-            "-o", control_path_opt,
-        },
+    const argv = try terminfoInstallArgv(
+        alloc,
+        builtin.target.os.tag,
+        opts.ssh,
         opts._ssh_args.items,
-        &.{remote_script},
-    });
+        remote_script,
+        control_path_opt,
+    );
+    defer alloc.free(argv);
     verbosePrint(opts, stderr, "exec: {f}", .{Joined{ .items = argv }});
 
     var child = std.process.spawn(global.io(), .{
@@ -598,6 +597,47 @@ fn installRemoteTerminfo(
         return error.InstallFailed;
     };
     checkExit(term, "terminfo install") catch return error.InstallFailed;
+}
+
+fn terminfoInstallArgv(
+    alloc: Allocator,
+    os_tag: std.Target.Os.Tag,
+    ssh: []const u8,
+    ssh_args: []const []const u8,
+    remote_script: []const u8,
+    control_path_opt: ?[]const u8,
+) Allocator.Error![]const []const u8 {
+    // Client ControlMaster is outside native Windows OpenSSH's supported
+    // scope. A one-shot install needs no multiplexing or control socket.
+    // https://github.com/PowerShell/Win32-OpenSSH/wiki/Project-Scope
+    const control_opts: []const []const u8 = if (os_tag == .windows) &.{} else &.{
+        "-o", "ControlMaster=yes",
+        "-o", "ControlPersist=no",
+        "-o", control_path_opt.?,
+    };
+    return std.mem.concat(alloc, []const u8, &.{
+        &.{ssh},
+        control_opts,
+        ssh_args,
+        &.{remote_script},
+    });
+}
+
+test "terminfo install argv preserves arguments without Windows multiplexing" {
+    const testing = std.testing;
+    const args: []const []const u8 = &.{ "-p", "2222", "alice@example.com" };
+    const windows_argv = try terminfoInstallArgv(testing.allocator, .windows, "ssh.exe", args, "remote script", null);
+    defer testing.allocator.free(windows_argv);
+    const expected_windows: []const []const u8 = &.{ "ssh.exe", "-p", "2222", "alice@example.com", "remote script" };
+    try testing.expectEqualDeep(expected_windows, windows_argv);
+    for ([_]std.Target.Os.Tag{ .linux, .macos }) |os_tag| {
+        const posix_argv = try terminfoInstallArgv(testing.allocator, os_tag, "ssh", args, "remote script", "ControlPath=/tmp/ghostty-ssh-test");
+        defer testing.allocator.free(posix_argv);
+        const expected_posix: []const []const u8 = &.{
+            "ssh", "-o", "ControlMaster=yes", "-o", "ControlPersist=no", "-o", "ControlPath=/tmp/ghostty-ssh-test", "-p", "2222", "alice@example.com", "remote script",
+        };
+        try testing.expectEqualDeep(expected_posix, posix_argv);
+    }
 }
 
 /// Run `argv` with the terminal's stdin, stdout, and stderr, and wait for
@@ -774,6 +814,35 @@ test "parseDestination: result is a valid cache key" {
     };
     for (outputs) |stdout| {
         const result = parseDestination(arena.allocator(), stdout).?;
+        try testing.expect(DiskCache.isValidCacheKey(result));
+    }
+}
+
+test "parseDestination: Windows OpenSSH CRLF output" {
+    const testing = std.testing;
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const cases = [_]struct { stdout: []const u8, expected: []const u8 }{
+        .{
+            .stdout = "user alice\r\nhostname example.com\r\nport 22\r\n",
+            .expected = "alice@example.com",
+        },
+        .{
+            .stdout = "user alice\r\nhostname example.com\r\nport 2222\r\n",
+            .expected = "alice@example.com:2222",
+        },
+        .{
+            .stdout = "user alice\r\nhostname 2001:db8::1\r\nport 22\r\n",
+            .expected = "alice@2001:db8::1",
+        },
+        .{
+            .stdout = "port 2222\r\nuser alice\r\nhostname 2001:db8::1\r\n",
+            .expected = "alice@[2001:db8::1]:2222",
+        },
+    };
+    for (cases) |case| {
+        const result = parseDestination(arena.allocator(), case.stdout).?;
+        try testing.expectEqualStrings(case.expected, result);
         try testing.expect(DiskCache.isValidCacheKey(result));
     }
 }

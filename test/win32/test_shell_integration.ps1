@@ -48,6 +48,35 @@ try {
     $Script:__ghostty_prompt_state = 'initial'
     $null = prompt
     $minimalOutput = $capture.ToString()
+    $capture.GetStringBuilder().Clear() | Out-Null
+
+    # PSDrive names can contain terminal controls that Windows rejects in
+    # ordinary filenames. Exercise a real provider location, keeping the VT
+    # output captured so the test never touches the desktop clipboard.
+    $unicodeName = [string][char]0x6d4b + [char]0x8bd5
+    $driveName = 'ghostty-' + $unicodeName + '-' + [guid]::NewGuid().ToString('N') +
+        [char]7 + [char]27 + ']52;c;SGVsbG8=' + [char]7 + [char]0x7f + [char]0x9b
+    # DEL and C1 controls are valid Windows filename characters. Cover the
+    # title's leaf as well as the drive-qualified working directory.
+    $directoryName = 'ghostty-shell-' + [guid]::NewGuid().ToString('N') + '-' +
+        $unicodeName + [char]0x7f + [char]0x9b
+    $hostileRoot = Join-Path $env:TEMP $directoryName
+    $originalLocation = Get-Location
+    try {
+        New-Item -ItemType Directory -Path $hostileRoot | Out-Null
+        New-PSDrive -Name $driveName -PSProvider FileSystem -Root $hostileRoot | Out-Null
+        Set-Location -LiteralPath ($driveName + ':\')
+        $hostileCwd = (Get-Location).Path -replace '\\', '/' -replace '\p{Cc}', ''
+        $hostileLeaf = $directoryName -replace '\p{Cc}', ''
+        $GhosttyFeatures = @('title')
+        $Script:__ghostty_prompt_state = 'initial'
+        $null = prompt
+        $hostileOutput = $capture.ToString()
+    } finally {
+        Set-Location -LiteralPath $originalLocation.Path
+        Remove-PSDrive -Name $driveName -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $hostileRoot -ErrorAction SilentlyContinue
+    }
 } finally {
     [Console]::SetOut($originalOutput)
     $capture.Dispose()
@@ -70,4 +99,8 @@ Assert-True ($secondOutput.StartsWith($esc + ']133;D;0' + $bel)) 'subsequent pro
 Assert-True ($preservedExitCode -eq 37) 'LASTEXITCODE is preserved'
 Assert-True (-not $minimalOutput.Contains($esc + '[5 q') -and -not $minimalOutput.Contains($esc + ']2;')) 'optional cursor and title features can be disabled'
 Assert-True ($null -ne $Script:enterHandler) 'Enter handler is registered without accepting input'
+Assert-True (-not $hostileOutput.Contains($esc + ']52;')) 'provider location cannot inject OSC clipboard commands'
+Assert-True ($hostileOutput.Contains($esc + "]7;file://$hostname/$hostileCwd" + $bel)) 'provider directory reports strip C0 and C1 controls'
+Assert-True ($hostileOutput.Contains($esc + "]2;$hostileLeaf" + $bel)) 'directory titles strip DEL and C1 controls'
+Assert-True ($hostileOutput.Contains($unicodeName)) 'directory reports preserve Unicode names'
 Write-Output "PowerShell $($PSVersionTable.PSVersion) shell integration checks passed"
