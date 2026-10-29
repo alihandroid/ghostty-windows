@@ -12,11 +12,11 @@ set -uo pipefail
 # Most legacy cases use desktop-global keyboard/mouse injection. Refuse them
 # before launching or cleaning up anything on a developer's shared desktop.
 case "${1:-all}" in
-    list|resize|window_properties|program_window_resize|tab_overview|reply_feedback|mouse_reporting) ;;
+    list|resize|window_properties|program_window_resize|tab_overview|reply_feedback|mouse_reporting|visibility) ;;
     *)
         if [ "${GHOSTTY_TEST_ISOLATED_DESKTOP:-}" != "1" ]; then
             echo "Input tests require a dedicated desktop and GHOSTTY_TEST_ISOLATED_DESKTOP=1." >&2
-            echo "Safe cases: program_window_resize, tab_overview, reply_feedback, mouse_reporting, resize, window_properties." >&2
+            echo "Safe cases: program_window_resize, tab_overview, reply_feedback, mouse_reporting, visibility, resize, window_properties." >&2
             exit 2
         fi
         ;;
@@ -711,6 +711,17 @@ test_mouse_reporting() {
     echo "▶ test_mouse_reporting (test-owned mouse messages only)"
     local script
     script="$(wslpath -w "$SCRIPT_DIR/test_mouse_reporting.ps1")"
+    if powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$script" -ExePath "$GHOSTTY_EXE"; then
+        PASS=$((PASS + 1))
+    else
+        FAIL=$((FAIL + 1))
+    fi
+}
+
+test_visibility() {
+    echo "▶ test_visibility (test-owned HWND messages only)"
+    local script
+    script="$(wslpath -w "$SCRIPT_DIR/test_visibility.ps1")"
     if powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$script" -ExePath "$GHOSTTY_EXE"; then
         PASS=$((PASS + 1))
     else
@@ -1776,6 +1787,7 @@ list_tests() {
     echo "  tab_overview       — Search, switch, close, and exit with owned HWNDs"
     echo "  reply_feedback     — Echoed replies stop after an SSH-style disconnect (WSL)"
     echo "  mouse_reporting    — Stale SGR tracking resets at the WSL zsh prompt"
+    echo "  visibility         — Hidden windows, zoom, minimize, and quick-terminal reports"
     echo "  notifications      — Desktop notification via OSC 9"
     echo "  window_size_config — Custom window size from config"
     echo "  search             — Search bar open/close/input"
@@ -1814,6 +1826,7 @@ run_test() {
         tab_overview)        test_tab_overview ;;
         reply_feedback)      test_reply_feedback ;;
         mouse_reporting)     test_mouse_reporting ;;
+        visibility)          test_visibility ;;
         notifications)       test_notifications ;;
         window_size_config)  test_window_size_config ;;
         search)              test_search ;;
@@ -1876,6 +1889,8 @@ case "${1:-all}" in
         test_reply_feedback
         echo ""
         test_mouse_reporting
+        echo ""
+        test_visibility
         echo ""
         test_notifications
         echo ""

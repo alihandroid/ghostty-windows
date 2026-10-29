@@ -33,6 +33,35 @@ Native Windows runtime using the shared upstream terminal core. Platform-specifi
 behavior is implemented separately; handling an action is not a guarantee of
 macOS/GTK feature parity.
 
+### Ghostty 1.4 compatibility
+
+The shared code includes the exact [upstream 1.4.0 release](https://ghostty.org/docs/install/release-notes/1-4-0)
+(`83fb95624`, released October 27, 2026). The planned Windows release uses the
+`win-v1.4.0` tag namespace and is held until full feature parity is verified.
+Matching the core version does not imply that every
+native app feature or upstream performance measurement applies to Windows.
+
+| Area | Windows status |
+|------|----------------|
+| Terminal parsing, reset, checksums, snapshots, and security fixes | Integrated from 1.4.0; focused core and Windows tests cover the shared behavior. ConPTY can consume some sequences before they reach Ghostty. |
+| Kitty graphics animation and relative placements | Shared implementation and renderer integrated; full protocol conformance through ConPTY has not been independently established. |
+| Scrollback compression and memory reclamation | Enabled with the Windows retained-mapping backend; upstream macOS/Linux benchmark figures are not Windows measurements. |
+| `ghostty +ssh` | Shared wrapper integrated; native OpenSSH CRLF output is handled and Windows does not request Unix socket multiplexing. Remote terminfo installation has not been tested against a live SSH server. |
+| Kitty clipboard (OSC 5522) | Text only. Image, HTML, and mixed-format writes are rejected as unsupported. Paste events (mode 5522), image previews, and remembered authorization UI are unavailable. |
+| Splits | Creation, navigation, divider resizing, zoom, and equalization work. Dragging a pane between splits, tabs, or windows is unavailable. |
+| Window navigation and state indicators | `goto_window` does not switch windows; key-sequence, key-table, and read-only status indicators are unavailable. |
+| Bell and inactive-pane appearance | Windows does not fully honor `bell-features` or the unfocused split opacity/fill settings. |
+| PowerShell shell features | Prompt marks, directory/title reports, and cursor features work. The exported `ssh-env`, `ssh-terminfo`, and `path` feature flags are not implemented by the PowerShell script. |
+| Tab overview | Searchable native title list; live thumbnails are unavailable. |
+| Inspector and session undo/redo | Unavailable; tracked in the roadmap. Upstream undo/redo is macOS-only. |
+| Distribution | Portable x64 ZIP; MSI/MSIX installers are unavailable. |
+
+The Windows audit also covers clipboard ownership and malformed text,
+surface destruction during close confirmation, canceled graphics commands,
+PowerShell prompt injection, and hidden-window visibility. See the
+[roadmap](ROADMAP.md) for the remaining product work and
+[testing instructions](#testing) for the checks behind these claims.
+
 ### Features
 
 **Terminal**
@@ -131,8 +160,8 @@ Requires [Zig](https://ziglang.org/download/) 0.17.0.
 
 ### Native build on Windows (recommended)
 
-```bash
-zig build -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu
+```powershell
+.\dist\windows\build.ps1 -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu
 ```
 
 The executable is at `zig-out/bin/ghostty.exe`. Building with the native
@@ -151,22 +180,17 @@ but still allows it to be renamed.
 
 ### Cross-compile from Linux/WSL2
 
-The same command works from Linux with the GNU ABI target
+Use `bash dist/windows/build.sh -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu`
+from Linux with the GNU ABI target
 (`x86_64-windows-gnu` — the plain `x86_64-windows` target selects the MSVC
 ABI, which cannot cross-compile from Linux because it lacks the MSVC
 headers).
 
-If a WSL build fails with `AccessDenied` while probing an unreadable Windows
-`PATH` entry, use a Linux-only `PATH` for that build command:
-
-```bash
-ghostty_build_path="$(printf '%s' "$PATH" | tr ':' '\n' | awk '!/^\/mnt\/[A-Za-z]\//' | paste -sd: -)"
-PATH="$ghostty_build_path" zig build -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu
-```
-
-This leaves the calling shell's `PATH` unchanged so `powershell.exe`, `cmd.exe`,
-and other Windows test tools remain available. Zig 0.17.0 must be on the Linux
-build path. Cross-compiling is not the same as running the native tests: use
+The wrapper excludes unreadable Windows `PATH` entries from Zig's compiler
+probes while leaving the calling shell's `PATH` unchanged, so `powershell.exe`,
+`cmd.exe`, and other Windows test tools remain available. It prefers the pinned
+Zig version under `~/.local/zig-versions`; set `ZIG` to select another compiler.
+Cross-compiling is not the same as running the native tests: use
 `test-build` to compile them, then run from a local Windows directory with their
 fixtures as described under [Testing](#testing).
 
@@ -196,10 +220,38 @@ To publish an existing `zig-out` build from Windows PowerShell instead:
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File dist/windows/install-dev.ps1
 ```
 
+### Build cache
+
+The desktop and packaging scripts automatically prune stale cache entries
+before building. For other builds and tests, use `bash dist/windows/build.sh`
+on Linux/WSL or `.\dist\windows\build.ps1` on Windows, followed by the usual
+`zig build` arguments (for example, `test-build -Dtest-filter=Screen`).
+
+Pruning retains entries accessed or modified within 30 days, the newest producer
+of each artifact name, and all cache entries referenced by those roots. It
+understands both object and build-configuration manifest outputs, so retained
+metadata cannot refer to deleted artifacts. Downloaded packages, compiler IR
+caches, temporary files, and installed development builds stay available.
+
+The wrapper holds `.zig-cache.lock` through pruning and the complete build.
+Other wrappers wait for that lock. A wrapped `run` holds it until the launched
+app exits; use the desktop shortcut for sessions that stay open during later
+builds. Pruning is deferred when another Zig process
+is running or metadata cannot be interpreted. Use the wrappers for concurrent
+development; direct Zig invocations do not participate in this lock. Custom
+cache directories selected with `--cache-dir` or `ZIG_LOCAL_CACHE_DIR` are
+measured but left untouched because they may be shared with other projects.
+
+Regular `zig build` commands also run a native size check, including cached
+builds, and warn above 20 GiB. This is a warning threshold rather than a hard cap:
+recent and referenced artifacts are retained even above the threshold. Prefer
+a consistent Zig version and optimization mode and use `-Dtest-filter` for
+focused tests to limit compiled variants.
+
 ### Release build
 
 ```bash
-zig build -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu -Doptimize=fast
+bash dist/windows/build.sh -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu -Doptimize=fast
 ```
 
 To debug a release build with stderr visible, add `-Dwindows-console=true`
@@ -213,6 +265,11 @@ From WSL with Zig 0.17.0 and Windows interop available:
 ```bash
 bash dist/windows/package.sh
 ```
+
+Once the parity gate is satisfied, check out the clean annotated release tag and run
+`bash dist/windows/package.sh --release`. Release packaging checks the exact tag,
+executable version, and numeric/string PE versions. Both development and release
+packaging reject incomplete resources and validate the portable layout.
 
 The ZIP is written to `dist/windows/ghostty-windows-x64-<version>.zip`.
 Extract it anywhere, keeping `ghostty.exe`, `conpty.dll`, and `OpenConsole.exe`
@@ -412,20 +469,33 @@ src/shell-integration/powershell/
 
 ## Testing
 
+The October 29, 2026 merge audit passed Windows debug and stripped `fast`
+application builds. The full Windows test executable ran from a local Windows
+directory with its fixtures: 4,099 passed, 71 skipped, zero failed. Focused
+native libghostty-vt tests passed 2,068 cases with 30 skipped. PowerShell shell
+integration passed 20 assertions under each of Windows PowerShell 5.1 and
+PowerShell 7; package/development-installation checks passed under both engines.
+The resize, tab-overview, reply-feedback, and mouse-reporting integration cases
+passed, and the visibility regression passed all 18 assertions under both
+engines. Tracked Zig sources passed formatting checks.
+
+These checks validate this merge and its fixes. They do not clear the feature
+parity release gate or replace the missing end-to-end checks in the roadmap.
+
 ### Zig unit tests
 
 From a local Windows checkout:
 
 ```powershell
-zig build test -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu
+.\dist\windows\build.ps1 test -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu
 # Prefer a filter for focused changes:
-zig build test -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu -Dtest-filter="program resize"
+.\dist\windows\build.ps1 test -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu -Dtest-filter="program resize"
 ```
 
 From WSL, compile without executing the Windows test runner:
 
 ```bash
-zig build test-build -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu -Demit-test-exe=true
+bash dist/windows/build.sh test-build -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu -Demit-test-exe=true
 ```
 
 Add `-Dtest-filter="program resize"` or `-Dtest-filter="tab overview"` to compile
@@ -473,6 +543,7 @@ bash test/win32/ghostty_test.sh program_window_resize
 bash test/win32/ghostty_test.sh tab_overview
 bash test/win32/ghostty_test.sh reply_feedback
 bash test/win32/ghostty_test.sh mouse_reporting
+bash test/win32/ghostty_test.sh visibility
 ```
 
 The resize test uses a file handshake. The overview test sends messages only
@@ -484,6 +555,9 @@ It covers device attributes, keyboard flags, glyph support/coverage/clearing,
 and clipboard status replies; clipboard access is denied for the test.
 The mouse-reporting test uses WSL Python 3 and zsh to check reporting before a
 disconnect, prompt cleanup, and re-enabling reports for the next application.
+The visibility test uses controlled WSL children and test-owned HWNDs to verify
+mode 2033 across hiding, hidden resizes, tab changes, split zoom,
+minimize/restore, and quick-terminal animation.
 These tests use no desktop-global keyboard/mouse injection. The harness stages the
 app under Windows `%TEMP%`. The `resize` and `window_properties` cases also
 avoid global input.
@@ -541,9 +615,12 @@ powershell.exe -ExecutionPolicy Bypass -File test/win32/test_splits.ps1 -ExePath
 
 This fork tracks `ghostty-org/ghostty` main branch.
 
-Last integrated upstream: `f54340ad7` (2026-10-21). This includes the shared
+Last integrated upstream: `v1.4.0` / `83fb95624` (2026-10-27), including 73
+additional commits after `f54340ad7`. This includes the shared
 terminal fixes, Kitty graphics/render-state and snapshot updates, checksum
-reporting controls, paste protection, and libghostty-vt API updates. Windows
+reporting controls, paste protection, and libghostty-vt API updates, plus the
+release fixes for tmux pane validation, scrollback cursor state, canceled APC
+commands, and shell working-directory reports. Windows
 retains WGL/ConPTY; upstream's GTK EGL/DMABUF presentation path is Linux-specific.
 The toolchain and Windows CI now use Zig 0.17.0 (`-Doptimize=fast` for releases).
 
@@ -560,6 +637,9 @@ git fetch upstream
 git switch -c sync/upstream-YYYY-MM-DD main
 git merge upstream/main
 ```
+
+For a versioned release, merge its exact upstream tag (as for `v1.4.0`) to keep
+the release baseline separate from subsequent development on upstream main.
 
 Optionally enable reusable conflict resolutions in your checkout with
 `git config rerere.enabled true`. Always review reused resolutions too.
