@@ -64,6 +64,10 @@ core_surface_initialized: bool = false,
 /// Win32 delivers codepoints > U+FFFF as two WM_CHAR messages (surrogate pair).
 high_surrogate: u16 = 0,
 
+/// Mirrors the pending dead key owned by this focused thread's ToUnicode
+/// calls. Both keyboard encoders update it; focus loss drains and clears it.
+dead_key_pending: bool = false,
+
 /// Bitmask of currently-pressed mouse buttons (left=1, right=2,
 /// middle=4). Used so SetCapture/ReleaseCapture only run on the
 /// 0→nonzero and nonzero→0 transitions; without this, a right-click
@@ -2415,8 +2419,9 @@ pub fn handleKeyEvent(self: *Surface, wparam: usize, lparam: isize, action: inpu
                 utf16_buf.len,
                 0,
             );
+            self.recordDeadKeyTranslation(result);
             if (result > 0) {
-                const utf16_slice = utf16_buf[0..@intCast(result)];
+                const utf16_slice = utf16_buf[0..@min(@as(usize, @intCast(result)), utf16_buf.len)];
                 // Skip Ctrl-induced control chars (0x01-0x1A): the core
                 // handles modifier combos via key + mods, and emitting
                 // the control char here would double-encode.
@@ -2977,75 +2982,111 @@ pub fn isWin32InputMode(self: *Surface) bool {
 /// Encode and send a key event in Win32 Input Mode format.
 /// Format: \x1b[Vk;Sc;Uc;Kd;Cs;Rc_
 fn sendWin32InputEvent(self: *Surface, vk: u16, lparam: isize, action: input.Action) void {
+    self.sendWin32InputEventWithNative(vk, lparam, action, w32);
+}
+
+fn sendWin32InputEventWithNative(
+    self: *Surface,
+    vk: u16,
+    lparam: isize,
+    action: input.Action,
+    comptime native: type,
+) void {
     const scancode: u16 = @intCast((lparam >> 16) & 0xFF);
     const extended = (lparam & (1 << 24)) != 0;
     const repeat_count: u16 = @intCast(lparam & 0xFFFF);
     const key_down: u1 = if (action == .press or action == .repeat) 1 else 0;
 
-    // Get the Unicode character for this key via ToUnicode. Skip
-    // modifier-only keys: they never produce a character and calling
-    // ToUnicode for them is one of the ways the per-thread kernel
-    // keyboard state can drift over time.
-    var unicode_chars: [4]u16 = .{ 0, 0, 0, 0 };
-    var unicode_count: usize = 1;
-    if (key_down == 1 and !isModifierVk(vk)) {
-        var keyboard_state: [256]u8 = undefined;
-        if (w32.GetKeyboardState(&keyboard_state) != 0) {
-            var utf16_buf: [4]u16 = undefined;
-            const result = w32.ToUnicode(
-                @intCast(vk),
-                @intCast(scancode),
-                &keyboard_state,
-                &utf16_buf,
-                utf16_buf.len,
-                0,
-            );
-            if (result > 0) {
-                // Composed (or literal) char — possibly produced by
-                // combining with a previously-pending dead key. The Uc field
-                // is 16-bit, so each UTF-16 code unit is sent as its own
-                // event. A dead key followed by a non-combining key (e.g.
-                // '~' then '/') yields two units ("~/") that must both be
-                // delivered; surrogate pairs are also sent unit by unit.
-                unicode_count = @intCast(result);
-                for (0..unicode_count) |i| unicode_chars[i] = utf16_buf[i];
-            } else if (result < 0) {
-                // VK is a dead key. ToUnicode stored it in the queue's
-                // dead-key state; the next press's ToUnicode call will
-                // compose with it. Send Uc=0 so applications reading the
-                // sequence don't see a stray dead char. The state is safe
-                // to keep because App.run skips TranslateMessage for
-                // surface windows — we are the only consumer.
-                unicode_chars[0] = 0;
-            }
-        }
-    }
-
     // Build the Win32 dwControlKeyState bitmask.
     var ctrl_state: u32 = 0;
-    if (w32.GetKeyState(@as(i32, w32.VK_RSHIFT)) < 0 or
-        w32.GetKeyState(@as(i32, w32.VK_LSHIFT)) < 0 or
-        w32.GetKeyState(@as(i32, w32.VK_SHIFT)) < 0)
+    if (native.GetKeyState(@as(i32, w32.VK_RSHIFT)) < 0 or
+        native.GetKeyState(@as(i32, w32.VK_LSHIFT)) < 0 or
+        native.GetKeyState(@as(i32, w32.VK_SHIFT)) < 0)
         ctrl_state |= 0x0010; // SHIFT_PRESSED
-    if (w32.GetKeyState(@as(i32, w32.VK_LCONTROL)) < 0)
+    if (native.GetKeyState(@as(i32, w32.VK_LCONTROL)) < 0)
         ctrl_state |= 0x0008; // LEFT_CTRL_PRESSED
-    if (w32.GetKeyState(@as(i32, w32.VK_RCONTROL)) < 0)
+    if (native.GetKeyState(@as(i32, w32.VK_RCONTROL)) < 0)
         ctrl_state |= 0x0004; // RIGHT_CTRL_PRESSED
-    if (w32.GetKeyState(@as(i32, w32.VK_LMENU)) < 0)
+    if (native.GetKeyState(@as(i32, w32.VK_LMENU)) < 0)
         ctrl_state |= 0x0002; // LEFT_ALT_PRESSED
-    if (w32.GetKeyState(@as(i32, w32.VK_RMENU)) < 0)
+    if (native.GetKeyState(@as(i32, w32.VK_RMENU)) < 0)
         ctrl_state |= 0x0001; // RIGHT_ALT_PRESSED
-    if (w32.GetKeyState(@as(i32, w32.VK_CAPITAL)) & 1 != 0)
+    if (native.GetKeyState(@as(i32, w32.VK_CAPITAL)) & 1 != 0)
         ctrl_state |= 0x0080; // CAPSLOCK_ON
-    if (w32.GetKeyState(@as(i32, w32.VK_NUMLOCK)) & 1 != 0)
+    if (native.GetKeyState(@as(i32, w32.VK_NUMLOCK)) & 1 != 0)
         ctrl_state |= 0x0020; // NUMLOCK_ON
-    if (w32.GetKeyState(@as(i32, w32.VK_SCROLL)) & 1 != 0)
+    if (native.GetKeyState(@as(i32, w32.VK_SCROLL)) & 1 != 0)
         ctrl_state |= 0x0040; // SCROLLLOCK_ON
     if (extended)
         ctrl_state |= 0x0100; // ENHANCED_KEY
 
-    for (unicode_chars[0..unicode_count]) |unicode_char| {
-        self.writeWin32InputSequence(vk, scancode, unicode_char, key_down, ctrl_state, repeat_count);
+    // Only key-downs consume the thread's dead-key state. Modifier-only
+    // keys cannot produce text, and releases must stay one physical event.
+    var keyboard_state: [256]u8 = undefined;
+    if (key_down == 0 or isModifierVk(vk) or
+        native.GetKeyboardState(&keyboard_state) == 0)
+    {
+        self.writeWin32InputSequence(vk, scancode, 0, key_down, ctrl_state, repeat_count);
+        return;
+    }
+
+    var remaining = @max(repeat_count, 1);
+    while (remaining > 0) {
+        var utf16_buf: [4]u16 = @splat(0);
+        const was_dead_key = self.dead_key_pending;
+        const result = native.ToUnicode(
+            @intCast(vk),
+            @intCast(scancode),
+            &keyboard_state,
+            &utf16_buf,
+            utf16_buf.len,
+            0,
+        );
+        self.recordDeadKeyTranslation(result);
+        const text = utf16_buf[0..if (result > 0)
+            @min(@as(usize, @intCast(result)), utf16_buf.len)
+        else
+            0];
+
+        // Preserve the compact ordinary-key path. Once a dead key is
+        // consumed, translate again for the remaining repeats: '~' then
+        // three 'a' presses is "\u{e3}aa", not three composed characters.
+        if (result == 0 or (text.len == 1 and !was_dead_key)) {
+            self.writeWin32InputSequence(vk, scancode, if (text.len == 1) text[0] else 0, 1, ctrl_state, remaining);
+            return;
+        }
+
+        self.writeWin32TranslatedKey(vk, scancode, ctrl_state, text);
+        remaining -= 1;
+    }
+}
+
+fn recordDeadKeyTranslation(self: *Surface, result: i32) void {
+    // A key with no translation (for example F1) leaves a dead key pending.
+    if (result != 0) self.dead_key_pending = result < 0;
+}
+
+/// A physical key can produce a spacing dead character plus text, a ligature,
+/// or a surrogate pair. Preserve the text without replaying the physical VK
+/// or its modifiers for every UTF-16 unit. Only the final scalar carries the
+/// real key-down; all other units are synthetic text, like WM_CHAR/IME input.
+fn writeWin32TranslatedKey(self: *Surface, vk: u16, sc: u16, cs: u32, text: []const u16) void {
+    if (text.len == 0) {
+        self.writeWin32InputSequence(vk, sc, 0, 1, cs, 1);
+        return;
+    }
+    const physical_idx = if (text.len >= 2 and
+        text[text.len - 1] >= 0xDC00 and text[text.len - 1] <= 0xDFFF and
+        text[text.len - 2] >= 0xD800 and text[text.len - 2] <= 0xDBFF)
+        text.len - 2
+    else
+        text.len - 1;
+    for (text, 0..) |char, i| {
+        if (i == physical_idx) {
+            self.writeWin32InputSequence(vk, sc, char, 1, cs, 1);
+        } else {
+            self.sendWin32CharEvent(char);
+        }
     }
 }
 
@@ -3090,6 +3131,188 @@ fn writeWin32InputSequence(
     self.core_surface.io.queueMessage(msg, .unlocked);
 }
 
+test "Win32 Input Mode preserves translated text without replaying physical keys" {
+    const testing = std.testing;
+    const Translation = struct { result: i32, text: []const u16 };
+    const Native = struct {
+        var translations: []const Translation = &.{};
+        var index: usize = 0;
+        var controls: u32 = 0;
+        var keyboard_available = true;
+        var expected_scancode: u32 = 53;
+
+        fn GetKeyboardState(keys: *[256]u8) i32 {
+            @memset(keys, 0);
+            return if (keyboard_available) 1 else 0;
+        }
+
+        fn GetKeyState(vk: i32) i16 {
+            const flag: u32 = switch (vk) {
+                w32.VK_RSHIFT => 0x10,
+                w32.VK_LCONTROL => 0x08,
+                w32.VK_RCONTROL => 0x04,
+                w32.VK_LMENU => 0x02,
+                w32.VK_RMENU => 0x01,
+                w32.VK_CAPITAL => return if (controls & 0x80 != 0) 1 else 0,
+                w32.VK_NUMLOCK => return if (controls & 0x20 != 0) 1 else 0,
+                w32.VK_SCROLL => return if (controls & 0x40 != 0) 1 else 0,
+                else => 0,
+            };
+            return if (controls & flag != 0) std.math.minInt(i16) else 0;
+        }
+
+        fn ToUnicode(_: u32, sc: u32, _: *const [256]u8, text: [*]u16, capacity: i32, flags: u32) i32 {
+            // Extended-key state belongs in Cs, never in the scancode.
+            std.debug.assert(sc == expected_scancode);
+            std.debug.assert(capacity == 4 and flags == 0);
+            const next = translations[index];
+            index += 1;
+            const len = @min(next.text.len, @as(usize, @intCast(capacity)));
+            @memcpy(text[0..len], next.text[0..len]);
+            return next.result;
+        }
+
+        fn expect(surface: *Surface, packets: []const []const u8) !void {
+            for (packets) |packet| {
+                const msg = surface.core_surface.io.mailbox.spsc.queue.pop(global.io()) orelse return error.ExpectedInput;
+                defer msg.deinit();
+                switch (msg) {
+                    .write_small => |write| try std.testing.expectEqualStrings(packet, write.data[0..write.len]),
+                    else => return error.UnexpectedInput,
+                }
+            }
+            try std.testing.expect(surface.core_surface.io.mailbox.spsc.queue.pop(global.io()) == null);
+            try std.testing.expectEqual(translations.len, index);
+        }
+    };
+    var core_app: @import("../../App.zig") = undefined;
+    core_app.alloc = testing.allocator;
+    var app: App = undefined;
+    app.core_app = &core_app;
+    const surface = try testing.allocator.create(Surface);
+    defer testing.allocator.destroy(surface);
+    surface.* = .{ .app = &app };
+    surface.core_surface.readonly = false;
+    surface.core_surface.io.mailbox = try termio.Mailbox.initSPSC(testing.allocator);
+    defer surface.core_surface.io.mailbox.deinit(testing.allocator);
+    const single: isize = (53 << 16) | 1;
+
+    // The first translation contains the spacing dead key. Only '/' carries
+    // the real VK and modifiers, and only that character repeats thereafter.
+    surface.recordDeadKeyTranslation(-1);
+    Native.controls = 0xFF;
+    Native.translations = &.{ .{ .result = 2, .text = &.{ '~', '/' } }, .{ .result = 1, .text = &.{'/'} } };
+    Native.index = 0;
+    surface.sendWin32InputEventWithNative(w32.VK_OEM_2, (1 << 24) | (53 << 16) | 3, .repeat, Native);
+    surface.sendWin32InputEventWithNative(w32.VK_OEM_2, (1 << 24) | single, .release, Native);
+    try Native.expect(surface, &.{
+        "\x1b[0;0;126;1;0;1_",     "\x1b[0;0;126;0;0;1_",
+        "\x1b[191;53;47;1;511;1_", "\x1b[191;53;47;1;511;2_",
+        "\x1b[191;53;0;0;511;1_",
+    });
+    try testing.expect(!surface.dead_key_pending);
+
+    Native.controls = 0;
+    Native.translations = &.{ .{ .result = 1, .text = &.{0xE3} }, .{ .result = 1, .text = &.{'a'} } };
+    Native.index = 0;
+    surface.recordDeadKeyTranslation(-1);
+    surface.sendWin32InputEventWithNative('A', (53 << 16) | 3, .repeat, Native);
+    try Native.expect(surface, &.{ "\x1b[65;53;227;1;0;1_", "\x1b[65;53;97;1;0;2_" });
+
+    // Surrogate repeats must remain high/low/high/low. Rc=2 on each unit
+    // would instead reconstruct high/high/low/low in the console input queue.
+    Native.translations = &.{ .{ .result = 2, .text = &.{ 0xD83D, 0xDE00 } }, .{ .result = 2, .text = &.{ 0xD83D, 0xDE00 } } };
+    Native.index = 0;
+    surface.sendWin32InputEventWithNative('A', (53 << 16) | 2, .repeat, Native);
+    try Native.expect(surface, &.{
+        "\x1b[65;53;55357;1;0;1_", "\x1b[0;0;56832;1;0;1_", "\x1b[0;0;56832;0;0;1_",
+        "\x1b[65;53;55357;1;0;1_", "\x1b[0;0;56832;1;0;1_", "\x1b[0;0;56832;0;0;1_",
+    });
+
+    // Ligatures repeat the entire string, not each character independently.
+    Native.translations = &.{ .{ .result = 2, .text = &.{ 'f', 'i' } }, .{ .result = 2, .text = &.{ 'f', 'i' } } };
+    Native.index = 0;
+    surface.sendWin32InputEventWithNative('A', (53 << 16) | 2, .repeat, Native);
+    try Native.expect(surface, &.{
+        "\x1b[0;0;102;1;0;1_", "\x1b[0;0;102;0;0;1_", "\x1b[65;53;105;1;0;1_",
+        "\x1b[0;0;102;1;0;1_", "\x1b[0;0;102;0;0;1_", "\x1b[65;53;105;1;0;1_",
+    });
+
+    // Only the documented returned length is valid; trailing units are ignored.
+    Native.translations = &.{.{ .result = 1, .text = &.{ 'x', 'y', 'z', '!' } }};
+    Native.index = 0;
+    surface.sendWin32InputEventWithNative('X', single, .press, Native);
+    try Native.expect(surface, &.{"\x1b[88;53;120;1;0;1_"});
+
+    // Even an invalid native count must never index outside the supplied
+    // buffer. Exercise every valid unit, with one real physical key action.
+    Native.translations = &.{.{ .result = 99, .text = &.{ 'w', 'x', 'y', 'z' } }};
+    Native.index = 0;
+    surface.sendWin32InputEventWithNative('Z', single, .press, Native);
+    try Native.expect(surface, &.{
+        "\x1b[0;0;119;1;0;1_",   "\x1b[0;0;119;0;0;1_",
+        "\x1b[0;0;120;1;0;1_",   "\x1b[0;0;120;0;0;1_",
+        "\x1b[0;0;121;1;0;1_",   "\x1b[0;0;121;0;0;1_",
+        "\x1b[90;53;122;1;0;1_",
+    });
+
+    // Coalesced repetitions of the dead key itself need separate translation
+    // too: later repeats can emit text and leave a new dead key pending.
+    Native.translations = &.{
+        .{ .result = -1, .text = &.{'~'} },
+        .{ .result = 1, .text = &.{'~'} },
+        .{ .result = -1, .text = &.{'~'} },
+    };
+    Native.index = 0;
+    surface.sendWin32InputEventWithNative(w32.VK_OEM_3, (53 << 16) | 3, .repeat, Native);
+    try Native.expect(surface, &.{ "\x1b[192;53;0;1;0;1_", "\x1b[192;53;126;1;0;1_", "\x1b[192;53;0;1;0;1_" });
+    try testing.expect(surface.dead_key_pending);
+
+    // No-text keys, modifiers, and releases do not consume the pending state.
+    Native.translations = &.{.{ .result = 0, .text = &.{} }};
+    Native.index = 0;
+    surface.sendWin32InputEventWithNative(w32.VK_F1, (53 << 16) | 2, .repeat, Native);
+    surface.sendWin32InputEventWithNative(w32.VK_SHIFT, single, .press, Native);
+    surface.sendWin32InputEventWithNative(w32.VK_SHIFT, single, .release, Native);
+    surface.sendWin32InputEventWithNative(w32.VK_F1, single, .release, Native);
+    try Native.expect(surface, &.{ "\x1b[112;53;0;1;0;2_", "\x1b[16;53;0;1;0;1_", "\x1b[16;53;0;0;0;1_", "\x1b[112;53;0;0;0;1_" });
+    try testing.expect(surface.dead_key_pending);
+
+    Native.keyboard_available = false;
+    Native.translations = &.{};
+    Native.index = 0;
+    surface.sendWin32InputEventWithNative('A', single, .press, Native);
+    try Native.expect(surface, &.{"\x1b[65;53;0;1;0;1_"});
+    try testing.expect(surface.dead_key_pending);
+    Native.keyboard_available = true;
+
+    // Both ordinary VT and Win32-input paths report their ToUnicode results
+    // through the same state latch, so a protocol switch cannot stale it.
+    surface.recordDeadKeyTranslation(1);
+    try testing.expect(!surface.dead_key_pending);
+    surface.recordDeadKeyTranslation(-1);
+    surface.recordDeadKeyTranslation(0);
+    try testing.expect(surface.dead_key_pending);
+
+    // Focus loss clears both our latch and the thread's native buffer. The
+    // fake native boundary makes this independent of the active keyboard layout.
+    surface.high_surrogate = 0xD83D;
+    Native.expected_scancode = 0x39;
+    Native.translations = &.{ .{ .result = 0, .text = &.{} }, .{ .result = 0, .text = &.{} } };
+    Native.index = 0;
+    surface.clearPendingKeyboardText(Native);
+    try Native.expect(surface, &.{});
+    try testing.expect(!surface.dead_key_pending);
+    try testing.expectEqual(@as(u16, 0), surface.high_surrogate);
+
+    surface.core_surface.readonly = true;
+    Native.expected_scancode = 53;
+    Native.translations = &.{.{ .result = 2, .text = &.{ '~', '/' } }};
+    Native.index = 0;
+    surface.sendWin32InputEventWithNative(w32.VK_OEM_2, single, .press, Native);
+    try Native.expect(surface, &.{});
+}
+
 /// Called by the renderer thread after SwapBuffers to signal that a
 /// frame has been presented. Wakes the main thread if it's blocking
 /// in handleResize during live resize.
@@ -3105,7 +3328,7 @@ pub fn handleFocus(self: *Surface, focused: bool) void {
     // Drop any buffered high surrogate and pending dead key on focus loss —
     // otherwise they would combine with the next character when focus returns.
     if (!focused) {
-        self.high_surrogate = 0;
+        self.clearPendingKeyboardText(w32);
         // Composition messages follow keyboard focus, so a split losing
         // focus mid-composition never gets its own WM_IME_ENDCOMPOSITION.
         // Cancel the composition and clear its inline preedit now.
@@ -3119,19 +3342,24 @@ pub fn handleFocus(self: *Surface, focused: bool) void {
             }
             self.core_surface.preeditCallback(null) catch {};
         }
-        // Drain any pending dead-key state so an unfinished compose
-        // doesn't bleed into the next focused surface or another app.
-        var ks: [256]u8 = undefined;
-        if (w32.GetKeyboardState(&ks) != 0) {
-            var buf: [4]u16 = undefined;
-            // 0x39 is the standard scancode for VK_SPACE on all layouts.
-            _ = w32.ToUnicode(@intCast(w32.VK_SPACE), 0x39, &ks, &buf, buf.len, 0);
-            _ = w32.ToUnicode(@intCast(w32.VK_SPACE), 0x39, &ks, &buf, buf.len, 0);
-        }
     }
     self.core_surface.focusCallback(focused) catch |err| {
         log.err("focus callback error: {}", .{err});
     };
+}
+
+fn clearPendingKeyboardText(self: *Surface, comptime native: type) void {
+    // Clear local state before any following IME cancellation can dispatch
+    // more messages, and drain native state before focus moves elsewhere.
+    self.high_surrogate = 0;
+    self.dead_key_pending = false;
+    var keys: [256]u8 = undefined;
+    if (native.GetKeyboardState(&keys) != 0) {
+        var buf: [4]u16 = undefined;
+        // 0x39 is the standard scancode for VK_SPACE on all layouts.
+        _ = native.ToUnicode(@intCast(w32.VK_SPACE), 0x39, &keys, &buf, buf.len, 0);
+        _ = native.ToUnicode(@intCast(w32.VK_SPACE), 0x39, &keys, &buf, buf.len, 0);
+    }
 }
 
 /// Get the current keyboard modifier state from Win32.
