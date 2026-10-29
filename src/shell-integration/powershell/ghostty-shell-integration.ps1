@@ -41,20 +41,26 @@ function prompt {
     # OSC 133;A — fresh line / new prompt.
     [Console]::Write("$Script:__ghostty_escape]133;A`a")
 
-    # Cursor shape: blinking bar at prompt (if cursor feature enabled).
-    if ($GhosttyFeatures -contains 'cursor') {
+    # setupFeatures emits the configured blink state with the cursor feature.
+    # Retain the bare name for manually configured older integrations.
+    if ($GhosttyFeatures -contains 'cursor:steady') {
+        [Console]::Write("$Script:__ghostty_escape[6 q")
+    } elseif ($GhosttyFeatures -contains 'cursor:blink' -or $GhosttyFeatures -contains 'cursor') {
         [Console]::Write("$Script:__ghostty_escape[5 q")
     }
 
     # OSC 7 — report current working directory.
-    $cwd = (Get-Location).Path -replace '\\', '/'
+    # A provider or PSDrive name can contain control characters even when a
+    # Windows filesystem path cannot. Keep those bytes out of OSC payloads so
+    # navigating to such a location cannot inject terminal commands.
+    $cwd = (Get-Location).Path -replace '\\', '/' -replace '\p{Cc}', ''
     # File URI: file://hostname/path
-    $hostname = [System.Net.Dns]::GetHostName()
+    $hostname = [System.Net.Dns]::GetHostName() -replace '\p{Cc}', ''
     [Console]::Write("$Script:__ghostty_escape]7;file://$hostname/$cwd`a")
 
     # OSC 2 — window title (current directory).
     if ($GhosttyFeatures -contains 'title') {
-        $leaf = Split-Path -Leaf (Get-Location)
+        $leaf = (Split-Path -Leaf (Get-Location)) -replace '\p{Cc}', ''
         [Console]::Write("$Script:__ghostty_escape]2;$leaf`a")
     }
 
@@ -80,7 +86,9 @@ if (Get-Module -Name PSReadLine -ErrorAction SilentlyContinue) {
         [Console]::Write("$Script:__ghostty_escape]133;C`a")
 
         # Reset cursor to default shape before command runs.
-        if ($GhosttyFeatures -contains 'cursor') {
+        if ($GhosttyFeatures -contains 'cursor:blink' -or
+            $GhosttyFeatures -contains 'cursor:steady' -or
+            $GhosttyFeatures -contains 'cursor') {
             [Console]::Write("$Script:__ghostty_escape[0 q")
         }
 

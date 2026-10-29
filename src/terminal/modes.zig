@@ -413,9 +413,9 @@ const entries: []const ModeEntry = &.{
     .{
         .name = "kitty_paste_events",
         .value = 5522,
-        // The macOS app and libghostty-vt can both serve the follow-up
-        // Kitty clipboard read that a paste event grants.
-        .disabled = build_options.artifact != .lib and builtin.target.os.tag != .macos,
+        // macOS, GTK, and libghostty-vt can serve the follow-up Kitty
+        // clipboard read. The Win32 clipboard backend is text-only.
+        .disabled = build_options.artifact != .lib and builtin.target.os.tag == .windows,
     },
     .{ .name = "win32_input", .value = 9001 },
 };
