@@ -2819,7 +2819,8 @@ fn sendWin32InputEvent(self: *Surface, vk: u16, lparam: isize, action: input.Act
     // modifier-only keys: they never produce a character and calling
     // ToUnicode for them is one of the ways the per-thread kernel
     // keyboard state can drift over time.
-    var unicode_char: u16 = 0;
+    var unicode_chars: [4]u16 = .{ 0, 0, 0, 0 };
+    var unicode_count: usize = 1;
     if (key_down == 1 and !isModifierVk(vk)) {
         var keyboard_state: [256]u8 = undefined;
         if (w32.GetKeyboardState(&keyboard_state) != 0) {
@@ -2834,12 +2835,13 @@ fn sendWin32InputEvent(self: *Surface, vk: u16, lparam: isize, action: input.Act
             );
             if (result > 0) {
                 // Composed (or literal) char — possibly produced by
-                // combining with a previously-pending dead key. Only the
-                // first UTF-16 code unit is captured; supplementary-plane
-                // compositions (result == 2, surrogate pair) are truncated
-                // to the high surrogate. This is a Win32 Input Mode protocol
-                // limitation: the Uc field is 16-bit.
-                unicode_char = utf16_buf[0];
+                // combining with a previously-pending dead key. The Uc field
+                // is 16-bit, so each UTF-16 code unit is sent as its own
+                // event. A dead key followed by a non-combining key (e.g.
+                // '~' then '/') yields two units ("~/") that must both be
+                // delivered; surrogate pairs are also sent unit by unit.
+                unicode_count = @intCast(result);
+                for (0..unicode_count) |i| unicode_chars[i] = utf16_buf[i];
             } else if (result < 0) {
                 // VK is a dead key. ToUnicode stored it in the queue's
                 // dead-key state; the next press's ToUnicode call will
@@ -2847,7 +2849,7 @@ fn sendWin32InputEvent(self: *Surface, vk: u16, lparam: isize, action: input.Act
                 // sequence don't see a stray dead char. The state is safe
                 // to keep because App.run skips TranslateMessage for
                 // surface windows — we are the only consumer.
-                unicode_char = 0;
+                unicode_chars[0] = 0;
             }
         }
     }
@@ -2875,7 +2877,9 @@ fn sendWin32InputEvent(self: *Surface, vk: u16, lparam: isize, action: input.Act
     if (extended)
         ctrl_state |= 0x0100; // ENHANCED_KEY
 
-    self.writeWin32InputSequence(vk, scancode, unicode_char, key_down, ctrl_state, repeat_count);
+    for (unicode_chars[0..unicode_count]) |unicode_char| {
+        self.writeWin32InputSequence(vk, scancode, unicode_char, key_down, ctrl_state, repeat_count);
+    }
 }
 
 /// Send a Win32 Input Mode event for a WM_CHAR character (IME, PostMessage, etc.)
