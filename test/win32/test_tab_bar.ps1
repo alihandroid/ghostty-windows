@@ -68,15 +68,25 @@ $work=Join-Path $env:TEMP ('ghostty-tab-bar-'+[guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory $work|Out-Null
 # Stage a matching portable payload locally even when this script is called
 # from a WSL checkout. UNC execution can trigger Windows security prompts.
-$binaryDirectory=Split-Path -Parent ([IO.Path]::GetFullPath($ExePath))
 $stagedExecutable=Join-Path $work 'ghostty-tab-bar-test.exe'
-Copy-Item -LiteralPath $ExePath -Destination $stagedExecutable
-foreach($runtime in @('conpty.dll','OpenConsole.exe')){
-    Copy-Item -LiteralPath (Join-Path $binaryDirectory $runtime) -Destination $work
-}
 $stagedShare=Join-Path $work 'share'
-Copy-Item -LiteralPath $ResourcesPath -Destination $stagedShare -Recurse
-if(-not(Test-Path -LiteralPath (Join-Path $stagedShare 'terminfo\ghostty.terminfo'))){throw 'Missing resource sentinel in the staged test payload'}
+try{
+    $binaryDirectory=Split-Path -Parent ([IO.Path]::GetFullPath($ExePath))
+    Copy-Item -LiteralPath $ExePath -Destination $stagedExecutable
+    foreach($runtime in @('conpty.dll','OpenConsole.exe')){
+        Copy-Item -LiteralPath (Join-Path $binaryDirectory $runtime) -Destination $work
+    }
+    # Compiled terminfo contains Unix symlinks that cannot be followed from
+    # Windows. Match portable packaging and copy only the plain-text sentinel.
+    foreach($relativePath in @('ghostty\themes','ghostty\shell-integration','terminfo\ghostty.terminfo','licenses\conpty\LICENSE.txt')){
+        $destination=Join-Path $stagedShare $relativePath
+        New-Item -ItemType Directory -Path (Split-Path -Parent $destination) -Force|Out-Null
+        Copy-Item -LiteralPath (Join-Path $ResourcesPath $relativePath) -Destination $destination -Recurse
+    }
+}catch{
+    Remove-Item -LiteralPath $work -Recurse -Force
+    throw
+}
 $fixture=Join-Path $work 'terminal.ps1'
 @'
 [Console]::OutputEncoding=[Text.UTF8Encoding]::new()
