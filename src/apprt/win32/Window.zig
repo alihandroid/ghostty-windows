@@ -1330,6 +1330,44 @@ fn layoutTabRects(
     return x;
 }
 
+/// Select the last tab midpoint crossed by a drag. Remainder pixels make the
+/// fitted tabs differ by one pixel, so use their actual rectangles.
+fn tabDragTarget(rects: []const w32.RECT, x: i32) usize {
+    var target: usize = 0;
+    for (rects, 0..) |rect, i| {
+        if (x >= rect.left + @divTrunc(rect.right - rect.left, 2)) target = i;
+    }
+    return target;
+}
+
+test "tab bar fills fitted width and retains minimum widths on overflow" {
+    const testing = std.testing;
+    var rects: [3]w32.RECT = undefined;
+    try testing.expectEqual(@as(i32, 965), layoutTabRects(&rects, 965, 32, 60));
+    try testing.expectEqual(@as(i32, 322), rects[0].right - rects[0].left);
+    try testing.expectEqual(@as(i32, 322), rects[1].right - rects[1].left);
+    try testing.expectEqual(@as(i32, 321), rects[2].right - rects[2].left);
+    try testing.expectEqual(rects[0].right, rects[1].left);
+    try testing.expectEqual(rects[1].right, rects[2].left);
+    try testing.expectEqual(@as(i32, 180), layoutTabRects(&rects, 100, 32, 60));
+    for (rects) |rect| try testing.expectEqual(@as(i32, 60), rect.right - rect.left);
+}
+
+test "tab bar drag reorder follows actual nonuniform tab midpoints" {
+    const testing = std.testing;
+    // Only the first tab gets the remainder pixel. Multiplying its width
+    // for every slot would put the final drag threshold a whole tab late.
+    var rects: [64]w32.RECT = undefined;
+    _ = layoutTabRects(&rects, 64 * 60 + 1, 32, 60);
+    for (rects, 0..) |rect, i| {
+        const midpoint = rect.left + @divTrunc(rect.right - rect.left, 2);
+        try testing.expectEqual(i, tabDragTarget(&rects, midpoint));
+        if (i > 0) try testing.expectEqual(i - 1, tabDragTarget(&rects, midpoint - 1));
+    }
+    try testing.expectEqual(@as(usize, 0), tabDragTarget(&rects, -100));
+    try testing.expectEqual(@as(usize, 63), tabDragTarget(&rects, 10000));
+}
+
 fn tabColor(bg: Config.Color, fg: Config.Color, weight: u8) u32 {
     const foreground: u16 = weight;
     const background: u16 = 255 - foreground;
@@ -2529,20 +2567,8 @@ pub fn windowWndProc(
                     window.drag_active = true;
                 }
                 if (window.drag_active and window.tab_count > 1) {
-                    // Use the uniform painted width for drag target
-                    // calculation.
                     const from: usize = @intCast(window.drag_tab);
-                    const first_w = window.tab_rects[0].right - window.tab_rects[0].left;
-                    var target: usize = 0;
-                    for (0..window.tab_count) |i| {
-                        const slot_left: i32 = @intCast(@as(i32, @intCast(i)) * first_w);
-                        const slot_mid = slot_left + @divTrunc(first_w, 2);
-                        if (x >= slot_mid) {
-                            target = i;
-                        }
-                    }
-                    // Clamp to valid range
-                    if (target >= window.tab_count) target = window.tab_count - 1;
+                    const target = tabDragTarget(window.tab_rects[0..window.tab_count], x);
                     if (target != from) {
                         window.moveTabTo(from, target);
                         window.drag_tab = @intCast(target);

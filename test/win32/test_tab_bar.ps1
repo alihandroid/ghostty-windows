@@ -66,6 +66,17 @@ New-Item -ItemType Directory -Force $OutputDirectory|Out-Null
 $OutputDirectory=[IO.Path]::GetFullPath($OutputDirectory)
 $work=Join-Path $env:TEMP ('ghostty-tab-bar-'+[guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory $work|Out-Null
+# Stage a matching portable payload locally even when this script is called
+# from a WSL checkout. UNC execution can trigger Windows security prompts.
+$binaryDirectory=Split-Path -Parent ([IO.Path]::GetFullPath($ExePath))
+$stagedExecutable=Join-Path $work 'ghostty-tab-bar-test.exe'
+Copy-Item -LiteralPath $ExePath -Destination $stagedExecutable
+foreach($runtime in @('conpty.dll','OpenConsole.exe')){
+    Copy-Item -LiteralPath (Join-Path $binaryDirectory $runtime) -Destination $work
+}
+$stagedShare=Join-Path $work 'share'
+Copy-Item -LiteralPath $ResourcesPath -Destination $stagedShare -Recurse
+if(-not(Test-Path -LiteralPath (Join-Path $stagedShare 'terminfo\ghostty.terminfo'))){throw 'Missing resource sentinel in the staged test payload'}
 $fixture=Join-Path $work 'terminal.ps1'
 @'
 [Console]::OutputEncoding=[Text.UTF8Encoding]::new()
@@ -97,7 +108,7 @@ function Start-Run([double]$opacity,[string]$name){
     $background=if($name -eq 'light'){'#ffffff'}else{'#1e1e2e'}
     $foreground=if($name -eq 'light'){'#1e1e2e'}else{'#ffffff'}
     @(('command = pwsh.exe -NoLogo -NoProfile -File "'+$fixture+'"'),('background-opacity = '+$opacity.ToString([Globalization.CultureInfo]::InvariantCulture)),('background = '+$background),('foreground = '+$foreground),'background-blur = false','font-family = Consolas','font-size = 14','window-show-tab-bar = always','shell-integration = none','confirm-close-surface = false','cursor-style-blink = false','auto-update = off','keybind = f9=new_tab','keybind = f4=next_tab')|Set-Content -Encoding utf8 $run.Config
-    $start=[Diagnostics.ProcessStartInfo]::new();$start.FileName=[IO.Path]::GetFullPath($ExePath);$start.UseShellExecute=$false;$start.CreateNoWindow=$true;$start.RedirectStandardOutput=$true;$start.RedirectStandardError=$true;$start.Environment['GHOSTTY_RESOURCES_DIR']=[IO.Path]::GetFullPath($ResourcesPath);$start.Environment['GHOSTTY_TAB_TEST_STATE']=$run.State
+    $start=[Diagnostics.ProcessStartInfo]::new();$start.FileName=$stagedExecutable;$start.WorkingDirectory=$work;$start.UseShellExecute=$false;$start.CreateNoWindow=$true;$start.RedirectStandardOutput=$true;$start.RedirectStandardError=$true;$start.Environment['GHOSTTY_RESOURCES_DIR']=Join-Path $stagedShare 'ghostty';$start.Environment['GHOSTTY_TAB_TEST_STATE']=$run.State
     $start.ArgumentList.Add('--config-default-files=false');$start.ArgumentList.Add('--config-file='+$run.Config)
     $run.Process=[Diagnostics.Process]::Start($start);$runs.Add($run);$run.Stdout=$run.Process.StandardOutput.ReadToEndAsync();$run.Stderr=$run.Process.StandardError.ReadToEndAsync()
     [TabBarTestNative]::ProcessId=$run.Process.Id
@@ -154,7 +165,8 @@ try{
         Check ([TabBarTestNative]::Text($current.Top) -eq 'renamed') "$($mode.Name): edited title persists only on its selected tab" @{Title='renamed';OriginalShell=$firstPid}
         Screenshot $current 'renamed-tab'
         [TabBarTestNative]::Post($current.Top,0x10,0,0)
-        if(-not $current.Process.WaitForExit(20000)){$current.Process.Kill($true);$current.Process.WaitForExit()}
+        Check ($current.Process.WaitForExit(20000)) "$($mode.Name): closing the test window exits without forced termination" @{}
+        Check ($current.Process.ExitCode -eq 0) "$($mode.Name): app exit succeeds" @{ExitCode=$current.Process.ExitCode}
     }
     $record.Status='passed'
 }catch{
