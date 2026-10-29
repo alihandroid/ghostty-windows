@@ -49,11 +49,14 @@ class CacheMaintenance(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         self.cache = self.root / ".zig-cache"
+        # setup-zig exports ZIG_LOCAL_CACHE_DIR on CI. Keep every fixture
+        # build in the disposable cache that the maintenance helper inspects.
+        self.env = dict(os.environ, ZIG_LOCAL_CACHE_DIR=str(self.cache))
 
     def invoke(self, *args, cache=None):
         return subprocess.run(
             [str(self.helper), str(cache or self.cache), *map(str, args)],
-            cwd=self.root, capture_output=True, text=True,
+            cwd=self.root, env=self.env, capture_output=True, text=True,
         )
 
     @staticmethod
@@ -67,7 +70,8 @@ class CacheMaintenance(unittest.TestCase):
     def test_real_cache_keeps_latest_build_and_generated_dependencies(self):
         (self.root / "build.zig").write_text(BUILD)
         def build(value):
-            subprocess.run([ZIG, "build", f"-Dvalue={value}"], cwd=self.root, check=True)
+            subprocess.run([ZIG, "build", f"-Dvalue={value}"], cwd=self.root,
+                           env=self.env, check=True)
         executable = "cache_probe.exe" if os.name == "nt" else "cache_probe"
         build(1)
         old_output = next((self.cache / "o").glob("*/" + executable)).parent
