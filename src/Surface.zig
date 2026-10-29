@@ -263,6 +263,11 @@ const Mouse = struct {
     /// Gesture state for text selection.
     selection_gesture: terminal.SelectionGesture = .init,
 
+    /// The second press cell, retained until this double-click moves away.
+    /// The gesture's tracked anchor can still be the first press in a nearby
+    /// cell, so its dragged flag alone cannot identify stationary updates.
+    double_click_point: ?terminal.point.Coordinate = null,
+
     /// The last x/y sent for mouse reports.
     event_point: ?terminal.point.Coordinate = null,
 
@@ -4304,6 +4309,7 @@ pub fn mouseButtonCallback(
             // is disabled in the middle of press (before release) we don't
             // suddenly start selecting text.
             self.mouse.selection_gesture.reset(self.renderer_state.terminal);
+            self.mouse.double_click_point = null;
 
             const pos = try self.rt_surface.getCursorPos();
 
@@ -4327,86 +4333,10 @@ pub fn mouseButtonCallback(
 
     // For left button clicks we always record some information for
     // selection/highlighting purposes.
-    if (button == .left and action == .press) click: {
+    if (button == .left and action == .press) {
         self.renderer_state.mutex.lockUncancelable(global.io());
         defer self.renderer_state.mutex.unlock(global.io());
-        const t: *terminal.Terminal = self.renderer_state.terminal;
-        const screen: *terminal.Screen = self.renderer_state.terminal.screens.active;
-
-        const pos = try self.rt_surface.getCursorPos();
-        const pin = pin: {
-            const pt_viewport = self.posToViewport(pos.x, pos.y);
-            const pin = screen.pages.pin(.{
-                .viewport = .{
-                    .x = pt_viewport.x,
-                    .y = pt_viewport.y,
-                },
-            }) orelse {
-                // Weird... our viewport x/y that we just converted isn't
-                // found in our pages. This is probably a bug but we don't
-                // want to crash in releases because its harmless. So, we
-                // only assert in debug mode.
-                if (comptime std.debug.runtime_safety) unreachable;
-                break :click;
-            };
-
-            break :pin pin;
-        };
-
-        var press_selection = try self.mouse.selection_gesture.press(t, .{
-            .time = std.Io.Timestamp.now(global.io(), .awake),
-            .pin = pin,
-            .xpos = pos.x,
-            .ypos = pos.y,
-            .max_distance = @floatFromInt(self.size.cell.width),
-            .repeat_interval = self.config.mouse_interval,
-            .word_boundary_codepoints = self.config.selection_word_chars,
-            .behaviors = &.{
-                .cell,
-                .word,
-                if (mods.ctrlOrSuper()) .output else .line,
-            },
-        });
-
-        // The gesture owns the standard single/double/triple-click selection
-        // behavior. Surface keeps terminal-surface-specific overrides here.
-        switch (self.mouse.selection_gesture.left_click_count) {
-            1 => {},
-
-            // Double click on a URL selects the entire URL instead of the
-            // standard word selection returned by the gesture.
-            2 => {
-                // Try link detection without requiring modifier keys.
-                if (self.linkAtPin(
-                    pin,
-                    null,
-                )) |result_| {
-                    if (result_) |result| {
-                        press_selection = result.selection;
-                    }
-                } else |_| {
-                    // Ignore any errors, likely regex errors.
-                }
-            },
-
-            3 => {},
-
-            // We should be bounded by 1 to 3
-            else => unreachable,
-        }
-
-        // Use `setSelection` (not `setSelectionAndCopy`) here to avoid
-        // touching the selection clipboard: for left mouse clicks we only
-        // copy on release.
-        if (press_selection) |selection| {
-            try self.setSelection(selection);
-            try self.queueRender();
-        } else if (self.mouse.selection_gesture.left_click_count == 1 and
-            self.io.terminal.screens.active.selection != null)
-        {
-            try self.setSelection(null);
-            try self.queueRender();
-        }
+        try self.mouseSelectionPress(try self.rt_surface.getCursorPos(), mods);
     }
 
     // Middle-click action, either ignore, or paste from clipboard or paste from the selection clipboard if supported.
@@ -4526,6 +4456,93 @@ pub fn mouseButtonCallback(
     }
 
     return false;
+}
+
+/// Apply the selection phase of a left-button press at a known position.
+/// The renderer mutex must be held. Keeping native position lookup outside
+/// this helper lets callback behavior be exercised without desktop input.
+fn mouseSelectionPress(self: *Surface, pos: apprt.CursorPos, mods: input.Mods) !void {
+    const t: *terminal.Terminal = self.renderer_state.terminal;
+    const screen: *terminal.Screen = self.renderer_state.terminal.screens.active;
+
+    const pin = pin: {
+        const pt_viewport = self.posToViewport(pos.x, pos.y);
+        const pin = screen.pages.pin(.{
+            .viewport = .{
+                .x = pt_viewport.x,
+                .y = pt_viewport.y,
+            },
+        }) orelse {
+            // Weird... our viewport x/y that we just converted isn't
+            // found in our pages. This is probably a bug but we don't
+            // want to crash in releases because its harmless. So, we
+            // only assert in debug mode.
+            if (comptime std.debug.runtime_safety) unreachable;
+            return;
+        };
+
+        break :pin pin;
+    };
+
+    var press_selection = try self.mouse.selection_gesture.press(t, .{
+        .time = std.Io.Timestamp.now(global.io(), .awake),
+        .pin = pin,
+        .xpos = pos.x,
+        .ypos = pos.y,
+        .max_distance = @floatFromInt(self.size.cell.width),
+        .repeat_interval = self.config.mouse_interval,
+        .word_boundary_codepoints = self.config.selection_word_chars,
+        .behaviors = &.{
+            .cell,
+            .word,
+            if (mods.ctrlOrSuper()) .output else .line,
+        },
+    });
+
+    self.mouse.double_click_point = if (self.mouse.selection_gesture.left_click_count == 2)
+        self.posToViewport(pos.x, pos.y)
+    else
+        null;
+
+    // The gesture owns the standard single/double/triple-click selection
+    // behavior. Surface keeps terminal-surface-specific overrides here.
+    switch (self.mouse.selection_gesture.left_click_count) {
+        1 => {},
+
+        // Double click on a URL selects the entire URL instead of the
+        // standard word selection returned by the gesture.
+        2 => {
+            // Try link detection without requiring modifier keys.
+            if (self.linkAtPin(
+                pin,
+                null,
+            )) |result_| {
+                if (result_) |result| {
+                    press_selection = result.selection;
+                }
+            } else |_| {
+                // Ignore any errors, likely regex errors.
+            }
+        },
+
+        3 => {},
+
+        // We should be bounded by 1 to 3
+        else => unreachable,
+    }
+
+    // Use `setSelection` (not `setSelectionAndCopy`) here to avoid
+    // touching the selection clipboard: for left mouse clicks we only
+    // copy on release.
+    if (press_selection) |selection| {
+        try self.setSelection(selection);
+        try self.queueRender();
+    } else if (self.mouse.selection_gesture.left_click_count == 1 and
+        self.io.terminal.screens.active.selection != null)
+    {
+        try self.setSelection(null);
+        try self.queueRender();
+    }
 }
 
 /// Requires the renderer state mutex is held.
@@ -5057,6 +5074,15 @@ pub fn cursorPosCallback(
             return;
         };
 
+        if (self.mouse.double_click_point) |point| {
+            if (!point.eql(pos_vp) or pos.x < 0 or pos.y < 0 or
+                pos.x >= @as(f64, @floatFromInt(self.size.screen.width)) or
+                pos.y >= @as(f64, @floatFromInt(self.size.screen.height)))
+            {
+                self.mouse.double_click_point = null;
+            }
+        }
+
         // Perform our drag behavior in our gesture handler.
         const drag_selection = self.mouse.selection_gesture.drag(t, .{
             .pin = pin,
@@ -5088,11 +5114,13 @@ pub fn cursorPosCallback(
             },
         }
 
-        // A double-click that hasn't left its original cell keeps the
-        // selection made on press. Recomputing it here would replace a
-        // whole-URL selection with the plain word (e.g. dropping "https:").
+        // Preserve the selection made by the second press until it really
+        // leaves that cell. Position notifications alone must not replace a
+        // whole URL with a word, including when the two presses hit adjacent
+        // cells. Once dragging starts, returning to the cell keeps normal
+        // word-drag behavior. Autoscroll above still updates on every motion.
         if (self.mouse.selection_gesture.left_click_count == 2 and
-            !self.mouse.selection_gesture.left_click_dragged) break :select;
+            self.mouse.double_click_point != null) break :select;
 
         // Update our selection based on the gesture state
         try self.setSelection(drag_selection);
@@ -5861,6 +5889,7 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
                 self.mouse.pending_scroll_x = 0;
                 self.mouse.pending_scroll_y = 0;
                 self.mouse.selection_gesture.reset(&self.io.terminal);
+                self.mouse.double_click_point = null;
                 self.selection_scroll_active = false;
             }
             if (comptime @hasDecl(apprt.Surface, "cancelMouseCapture")) {
@@ -7102,6 +7131,167 @@ test "Surface toggle mouse reporting refreshes link hover and modifier shapes" {
     try testing.expect(surface.renderer_state.mouse.mods.equal(ctrl_shift));
     try testing.expectEqual(terminal.MouseEvent.any, term.flags.mouse_event);
     try testing.expect(surface.io.mailbox.spsc.queue.pop(global.io()) == null);
+}
+
+test "Surface double-click selection survives stationary motion and still drags" {
+    const build_config = @import("build_config.zig");
+    if (comptime build_config.app_runtime != .win32 or build_config.artifact != .exe)
+        return error.SkipZigTest;
+
+    const testing = std.testing;
+    try oni.testing.ensureInit();
+    const url = "https://example.test/path";
+    const Case = struct {
+        kind: enum { url, adjacent, word, single, triple, recycled },
+        mods: input.Mods = .{},
+    };
+    const cases = [_]Case{
+        .{ .kind = .url },
+        .{ .kind = .adjacent },
+        .{ .kind = .url, .mods = .{ .shift = true } },
+        .{ .kind = .url, .mods = input.ctrlOrSuper(.{}) },
+        .{ .kind = .word },
+        .{ .kind = .single },
+        .{ .kind = .triple },
+        .{ .kind = .recycled },
+    };
+    for (cases) |case| {
+        var core_app: App = undefined;
+        core_app.alloc = testing.allocator;
+        var app: apprt.runtime.App = undefined;
+        app.core_app = &core_app;
+        const native_surface = try testing.allocator.create(apprt.runtime.Surface);
+        defer testing.allocator.destroy(native_surface);
+        native_surface.* = .{ .app = &app, .core_surface_ready = true };
+        const surface = &native_surface.core_surface;
+        surface.alloc = testing.allocator;
+        surface.rt_app = &app;
+        surface.rt_surface = native_surface;
+        surface.inspector = null;
+        surface.readonly = false;
+        surface.selection_scroll_active = false;
+        surface.mouse = .{ .mods = case.mods };
+        surface.mouse.click_state[@backingInt(input.MouseButton.left)] = .press;
+        surface.config.mouse_reporting = false;
+        surface.config.mouse_shift_capture = .false;
+        surface.config.mouse_interval = std.time.ns_per_s;
+        surface.config.selection_word_chars = (configpkg.Config.SelectionWordChars{}).codepoints;
+        surface.config.link_osc8 = false;
+        surface.config.link_previews = .false;
+        const configured_link: input.Link = .{
+            .regex = "https://[^ ]+",
+            .action = .open,
+            // Double-click matching deliberately ignores these modifiers.
+            // None of the cases satisfy them, so no native cursor is changed.
+            .highlight = .{ .hover_mods = .{ .alt = true } },
+        };
+        var regex = try configured_link.oniRegex();
+        defer regex.deinit();
+        var links = [_]DerivedConfig.Link{.{
+            .regex = regex,
+            .action = configured_link.action,
+            .highlight = configured_link.highlight,
+        }};
+        surface.config.links = &links;
+        surface.size = .{
+            .screen = .{ .width = 640, .height = 40 },
+            .cell = .{ .width = 10, .height = 10 },
+            .padding = .{},
+        };
+        surface.io.terminal = try terminal.Terminal.init(global.io(), testing.allocator, .{ .cols = 64, .rows = 4 });
+        defer surface.io.terminal.deinit(testing.allocator);
+        const term = &surface.io.terminal;
+        defer surface.mouse.selection_gesture.deinit(term);
+        if (case.kind == .recycled) _ = try term.switchScreen(.alternate);
+        var stream: terminal.TerminalStream = .init(.{
+            .allocator = testing.allocator,
+            .handler = .init(term),
+        });
+        defer stream.deinit();
+        stream.nextSlice("header\r\n" ++ url ++ " tail words\r\nnext line words");
+        var mutex: std.Io.Mutex = .init;
+        surface.renderer_state = .{ .mutex = &mutex, .terminal = term };
+        surface.io.renderer_state = &surface.renderer_state;
+        surface.renderer_thread.wakeup = try global.xev.Async.init();
+        defer surface.renderer_thread.wakeup.deinit();
+        surface.io.mailbox = try termio.Mailbox.initSPSC(testing.allocator);
+        defer surface.io.mailbox.deinit(testing.allocator);
+
+        const second: apprt.CursorPos = .{ .x = if (case.kind == .word) 285 else 105, .y = 15 };
+        const first: apprt.CursorPos = if (case.kind == .adjacent)
+            .{ .x = 99, .y = 15 }
+        else
+            second;
+        {
+            mutex.lockUncancelable(global.io());
+            defer mutex.unlock(global.io());
+            // The real press selection phase, including configured URL regex
+            // matching, runs at supplied coordinates without a native window.
+            try surface.mouseSelectionPress(first, case.mods);
+            try testing.expect(term.screens.active.selection == null);
+            if (case.kind != .single) try surface.mouseSelectionPress(second, case.mods);
+        }
+        if (case.kind == .single) {
+            try surface.cursorPosCallback(.{ .x = 125, .y = 15 }, null);
+            try testing.expect(term.screens.active.selection != null);
+            try testing.expect(surface.mouse.selection_gesture.left_click_dragged);
+            continue;
+        }
+        const expected: []const u8 = if (case.kind == .word) "tail" else url;
+        {
+            const selected = (try surface.selectionString(testing.allocator)).?;
+            defer testing.allocator.free(selected);
+            try testing.expectEqualStrings(expected, selected);
+        }
+        // A duplicate position notification and sub-cell jitter must retain
+        // the selection established by the second press, including its scheme.
+        try surface.cursorPosCallback(second, null);
+        try surface.cursorPosCallback(.{ .x = second.x + 0.25, .y = second.y + 0.25 }, null);
+        {
+            const selected = (try surface.selectionString(testing.allocator)).?;
+            defer testing.allocator.free(selected);
+            try testing.expectEqualStrings(expected, selected);
+        }
+        try testing.expect(surface.mouse.double_click_point != null);
+        try testing.expect(!surface.mouse.over_link);
+
+        if (case.kind == .recycled) {
+            _ = try term.switchScreen(.primary);
+            term.screens.remove(testing.allocator, .alternate);
+            _ = try term.switchScreen(.alternate);
+            stream.nextSlice("replacement screen");
+            try surface.cursorPosCallback(second, null);
+            try testing.expect(term.screens.active.selection == null);
+            continue;
+        }
+        if (case.kind == .triple) {
+            mutex.lockUncancelable(global.io());
+            try surface.mouseSelectionPress(second, .{});
+            mutex.unlock(global.io());
+            try testing.expectEqual(@as(u3, 3), surface.mouse.selection_gesture.left_click_count);
+            try testing.expect(surface.mouse.double_click_point == null);
+            try surface.cursorPosCallback(second, null);
+            const selected = (try surface.selectionString(testing.allocator)).?;
+            defer testing.allocator.free(selected);
+            try testing.expectEqualStrings(url ++ " tail words", selected);
+            continue;
+        }
+        // Crossing cells must resume word dragging, and returning to the
+        // original cell must not resurrect the special whole-URL selection.
+        try surface.cursorPosCallback(.{ .x = 345, .y = 15 }, null);
+        try testing.expect(surface.mouse.double_click_point == null);
+        {
+            const selected = (try surface.selectionString(testing.allocator)).?;
+            defer testing.allocator.free(selected);
+            try testing.expect(std.mem.endsWith(u8, selected, " tail words") or std.mem.eql(u8, selected, "tail words"));
+        }
+        try surface.cursorPosCallback(second, null);
+        {
+            const selected = (try surface.selectionString(testing.allocator)).?;
+            defer testing.allocator.free(selected);
+            try testing.expectEqualStrings(if (case.kind == .word) "tail" else "//example.test/path", selected);
+        }
+    }
 }
 
 test "Mouse.click_state holds every button" {
