@@ -11,6 +11,21 @@ function Assert-True($condition, $description) {
     Write-Output "PASS=$description"
 }
 
+# Use an inert PSReadLine endpoint so the registered Enter handler itself can
+# run without ever accepting input. A fresh noninteractive engine has not
+# loaded the real assembly; refuse to replace it if this test was sourced.
+if ('Microsoft.PowerShell.PSConsoleReadLine' -as [type]) {
+    throw 'Run shell integration tests in a fresh noninteractive PowerShell process.'
+}
+Add-Type @'
+namespace Microsoft.PowerShell {
+    public static class PSConsoleReadLine {
+        public static int AcceptLineCalls;
+        public static void AcceptLine() { AcceptLineCalls++; }
+    }
+}
+'@
+
 # Capture registration without loading PSReadLine or accepting console input.
 function Get-Module {
     param([string]$Name, [string]$ErrorAction)
@@ -31,7 +46,8 @@ $capture = New-Object System.IO.StringWriter
 $Script:enterHandler = $null
 try {
     [Console]::SetOut($capture)
-    $env:GHOSTTY_SHELL_FEATURES = 'cursor,title'
+    # This is the actual value produced by setupFeatures with blinking enabled.
+    $env:GHOSTTY_SHELL_FEATURES = 'cursor:blink,path,ssh-env,ssh-terminfo,sudo,title'
     . $IntegrationPath
 
     $firstPrompt = prompt
@@ -44,10 +60,31 @@ try {
     $preservedExitCode = $global:LASTEXITCODE
     $capture.GetStringBuilder().Clear() | Out-Null
 
+    & $Script:enterHandler
+    $blinkEnterOutput = $capture.ToString()
+    $capture.GetStringBuilder().Clear() | Out-Null
+
+    # setupFeatures uses :steady when cursor-style-blink is false.
+    $GhosttyFeatures = 'cursor:steady,path,ssh-env,ssh-terminfo,sudo,title' -split ','
+    $null = prompt
+    $steadyOutput = $capture.ToString()
+    $capture.GetStringBuilder().Clear() | Out-Null
+    & $Script:enterHandler
+    $steadyEnterOutput = $capture.ToString()
+    $capture.GetStringBuilder().Clear() | Out-Null
+
+    $GhosttyFeatures = @('cursor')
+    $null = prompt
+    $legacyOutput = $capture.ToString()
+    $capture.GetStringBuilder().Clear() | Out-Null
+
     $GhosttyFeatures = @()
     $Script:__ghostty_prompt_state = 'initial'
     $null = prompt
     $minimalOutput = $capture.ToString()
+    $capture.GetStringBuilder().Clear() | Out-Null
+    & $Script:enterHandler
+    $minimalEnterOutput = $capture.ToString()
     $capture.GetStringBuilder().Clear() | Out-Null
 
     # PSDrive names can contain terminal controls that Windows rejects in
@@ -91,13 +128,19 @@ $hostname = [System.Net.Dns]::GetHostName()
 $leaf = Split-Path -Leaf (Get-Location)
 Assert-True ($firstPrompt -eq 'ghostty-test> ' -and $secondPrompt -eq $firstPrompt) 'original prompt text is preserved'
 Assert-True ($firstOutput.StartsWith($esc + ']133;A' + $bel)) 'first prompt starts with a real ESC semantic marker'
-Assert-True ($firstOutput.Contains($esc + '[5 q')) 'cursor sequence uses a real ESC'
+Assert-True ($firstOutput.Contains($esc + '[5 q') -and -not $firstOutput.Contains($esc + '[6 q')) 'generated blinking cursor feature emits DECSCUSR 5'
+Assert-True ($steadyOutput.Contains($esc + '[6 q') -and -not $steadyOutput.Contains($esc + '[5 q')) 'generated steady cursor feature emits DECSCUSR 6'
+Assert-True ($blinkEnterOutput -eq ($esc + ']133;C' + $bel + $esc + '[0 q')) 'blinking cursor restores the default before command execution'
+Assert-True ($steadyEnterOutput -eq ($esc + ']133;C' + $bel + $esc + '[0 q')) 'steady cursor restores the default before command execution'
+Assert-True ($legacyOutput.Contains($esc + '[5 q')) 'legacy bare cursor feature retains blinking-bar behavior'
 Assert-True ($firstOutput.Contains($esc + "]7;file://$hostname/$cwd" + $bel)) 'working directory sequence uses a real ESC'
 Assert-True ($firstOutput.Contains($esc + "]2;$leaf" + $bel)) 'title sequence uses a real ESC'
 Assert-True ($firstOutput.EndsWith($esc + ']133;B' + $bel)) 'prompt end uses a real ESC'
 Assert-True ($secondOutput.StartsWith($esc + ']133;D;0' + $bel)) 'subsequent prompt reports command completion'
 Assert-True ($preservedExitCode -eq 37) 'LASTEXITCODE is preserved'
-Assert-True (-not $minimalOutput.Contains($esc + '[5 q') -and -not $minimalOutput.Contains($esc + ']2;')) 'optional cursor and title features can be disabled'
+Assert-True (-not $minimalOutput.Contains($esc + '[5 q') -and -not $minimalOutput.Contains($esc + '[6 q') -and -not $minimalOutput.Contains($esc + ']2;')) 'optional cursor and title features can be disabled'
+Assert-True ($minimalEnterOutput -eq ($esc + ']133;C' + $bel)) 'disabled cursor feature emits no command-start cursor control'
+Assert-True ([Microsoft.PowerShell.PSConsoleReadLine]::AcceptLineCalls -eq 3) 'registered Enter handler reaches the inert PSReadLine endpoint'
 Assert-True ($null -ne $Script:enterHandler) 'Enter handler is registered without accepting input'
 Assert-True (-not $hostileOutput.Contains($esc + ']52;')) 'provider location cannot inject OSC clipboard commands'
 Assert-True ($hostileOutput.Contains($esc + "]7;file://$hostname/$hostileCwd" + $bel)) 'provider directory reports strip C0 and C1 controls'

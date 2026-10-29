@@ -41,8 +41,11 @@ function prompt {
     # OSC 133;A — fresh line / new prompt.
     [Console]::Write("$Script:__ghostty_escape]133;A`a")
 
-    # Cursor shape: blinking bar at prompt (if cursor feature enabled).
-    if ($GhosttyFeatures -contains 'cursor') {
+    # setupFeatures emits the configured blink state with the cursor feature.
+    # Retain the bare name for manually configured older integrations.
+    if ($GhosttyFeatures -contains 'cursor:steady') {
+        [Console]::Write("$Script:__ghostty_escape[6 q")
+    } elseif ($GhosttyFeatures -contains 'cursor:blink' -or $GhosttyFeatures -contains 'cursor') {
         [Console]::Write("$Script:__ghostty_escape[5 q")
     }
 
@@ -83,7 +86,9 @@ if (Get-Module -Name PSReadLine -ErrorAction SilentlyContinue) {
         [Console]::Write("$Script:__ghostty_escape]133;C`a")
 
         # Reset cursor to default shape before command runs.
-        if ($GhosttyFeatures -contains 'cursor') {
+        if ($GhosttyFeatures -contains 'cursor:blink' -or
+            $GhosttyFeatures -contains 'cursor:steady' -or
+            $GhosttyFeatures -contains 'cursor') {
             [Console]::Write("$Script:__ghostty_escape[0 q")
         }
 
