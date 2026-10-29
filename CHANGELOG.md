@@ -5,8 +5,18 @@ the underlying upstream commit when known.
 
 ## Unreleased
 
+Release target: `win-v1.4.0`, based on upstream Ghostty `v1.4.0` (`83fb95624`,
+released 2026-10-27), with the native Win32 runtime and the Windows fixes below.
+Publication is held until full feature parity is implemented and verified.
+The README compatibility table and roadmap track the remaining gaps.
+
 ### Upstream
 
+- Merge the final 73 upstream commits after `f54340ad7`, including fixes for
+  zero-sized and oversized tmux panes, scrollback cursor style/hyperlink
+  lifetime, erased-history image placements, C1 sequence continuations,
+  canceled graphics commands, and shell working-directory injection.
+- Update z2d to 0.13.0 and refresh the bundled theme collection.
 - Sync 733 upstream commits through `f54340ad7` (2026-10-21), including terminal,
   Kitty graphics/render-state, snapshot, paste-protection, and libghostty-vt updates.
 - Add opt-in program-requested resizing (CSI 8 t), DECSTR soft reset,
@@ -20,6 +30,24 @@ the underlying upstream commit when known.
 
 ### Windows Fixes and Adaptations
 
+- Use the stable application window as clipboard owner, propagate native
+  write failures, and reject unsupported Kitty clipboard representations
+  instead of acknowledging data that was not written.
+- Bound Unicode clipboard reads to the allocation size and reject malformed
+  or unterminated text before converting it.
+- Resolve surface identity again after close confirmation so a child exit
+  during the dialog cannot leave a stale surface pointer.
+- Report hidden and restored window visibility to the terminal core, including
+  quick terminals and split zoom, without waking panes that remain hidden.
+- Discard canceled or aborted graphics/glyph commands in the application
+  stream handler as well as the terminal library.
+- Strip control characters from PowerShell working-directory and title
+  reports, including provider and PSDrive names, while preserving Unicode.
+- Honor the core's `cursor:blink` and `cursor:steady` shell feature values
+  in PowerShell, including cursor restoration when accepting a command.
+- Parse native OpenSSH CRLF destination reports correctly and omit Unix
+  socket multiplexing options on Windows during terminfo installation.
+- Update all Windows executable version resources to 1.4.0.0.
 - Honor read-only mode for Win32 keyboard and IME input packets.
 - Preserve search, command-palette, and link-preview window ownership when
   detaching tabs, and keep popup destruction from invalidating a live terminal.
@@ -66,6 +94,16 @@ the underlying upstream commit when known.
 
 ### Testing and Development
 
+- Require a clean annotated `win-vX.Y.Z` tag for production packages. Validate
+  the executable version, all PE version fields, required resources, and the
+  flattened portable layout; include the project MIT license in the ZIP.
+- Add packaging regression checks to Windows CI and exercise payload
+  validation under both Windows PowerShell 5.1 and PowerShell 7.
+- Add clipboard ownership/failure and modal-lifetime regressions without
+  replacing the desktop clipboard, plus canceled-command, OpenSSH CRLF, and
+  PowerShell prompt-injection coverage.
+- Automatically prune stale development cache entries before compilation
+  under a build guard, and warn about local cache growth on development builds.
 - Add focused input and popup-lifetime regressions, and extend the bounded
   reply-feedback test to glyph and clipboard replies without clipboard access.
 - Add the phased Windows feature roadmap with explicit completion criteria

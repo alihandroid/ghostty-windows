@@ -33,6 +33,35 @@ Native Windows runtime using the shared upstream terminal core. Platform-specifi
 behavior is implemented separately; handling an action is not a guarantee of
 macOS/GTK feature parity.
 
+### Ghostty 1.4 compatibility
+
+The shared code includes the exact [upstream 1.4.0 release](https://ghostty.org/docs/install/release-notes/1-4-0)
+(`83fb95624`, released October 27, 2026). The planned Windows release uses the
+`win-v1.4.0` tag namespace and is held until full feature parity is verified.
+Matching the core version does not imply that every
+native app feature or upstream performance measurement applies to Windows.
+
+| Area | Windows status |
+|------|----------------|
+| Terminal parsing, reset, checksums, snapshots, and security fixes | Integrated from 1.4.0; focused core and Windows tests cover the shared behavior. ConPTY can consume some sequences before they reach Ghostty. |
+| Kitty graphics animation and relative placements | Shared implementation and renderer integrated; full protocol conformance through ConPTY has not been independently established. |
+| Scrollback compression and memory reclamation | Enabled with the Windows retained-mapping backend; upstream macOS/Linux benchmark figures are not Windows measurements. |
+| `ghostty +ssh` | Shared wrapper integrated; native OpenSSH CRLF output is handled and Windows does not request Unix socket multiplexing. Remote terminfo installation has not been tested against a live SSH server. |
+| Kitty clipboard (OSC 5522) | Text only. Image, HTML, and mixed-format writes are rejected as unsupported. Paste events (mode 5522), image previews, and remembered authorization UI are unavailable. |
+| Splits | Creation, navigation, divider resizing, zoom, and equalization work. Dragging a pane between splits, tabs, or windows is unavailable. |
+| Window navigation and state indicators | `goto_window` does not switch windows; key-sequence, key-table, and read-only status indicators are unavailable. |
+| Bell and inactive-pane appearance | Windows does not fully honor `bell-features` or the unfocused split opacity/fill settings. |
+| PowerShell shell features | Prompt marks, directory/title reports, and cursor features work. The exported `ssh-env`, `ssh-terminfo`, and `path` feature flags are not implemented by the PowerShell script. |
+| Tab overview | Searchable native title list; live thumbnails are unavailable. |
+| Inspector and session undo/redo | Unavailable; tracked in the roadmap. Upstream undo/redo is macOS-only. |
+| Distribution | Portable x64 ZIP; MSI/MSIX installers are unavailable. |
+
+The Windows audit also covers clipboard ownership and malformed text,
+surface destruction during close confirmation, canceled graphics commands,
+PowerShell prompt injection, and hidden-window visibility. See the
+[roadmap](ROADMAP.md) for the remaining product work and
+[testing instructions](#testing) for the checks behind these claims.
+
 ### Features
 
 **Terminal**
@@ -236,6 +265,11 @@ From WSL with Zig 0.17.0 and Windows interop available:
 bash dist/windows/package.sh
 ```
 
+Once the parity gate is satisfied, check out the clean annotated release tag and run
+`bash dist/windows/package.sh --release`. Release packaging checks the exact tag,
+executable version, and numeric/string PE versions. Both development and release
+packaging reject incomplete resources and validate the portable layout.
+
 The ZIP is written to `dist/windows/ghostty-windows-x64-<version>.zip`.
 Extract it anywhere, keeping `ghostty.exe`, `conpty.dll`, and `OpenConsole.exe`
 together beside the bundled `share/` tree. The pinned Microsoft ConPTY backend
@@ -434,6 +468,19 @@ src/shell-integration/powershell/
 
 ## Testing
 
+The October 29, 2026 merge audit passed Windows debug and stripped `fast`
+application builds. The full Windows test executable ran from a local Windows
+directory with its fixtures: 4,099 passed, 71 skipped, zero failed. Focused
+native libghostty-vt tests passed 2,068 cases with 30 skipped. PowerShell shell
+integration passed 20 assertions under each of Windows PowerShell 5.1 and
+PowerShell 7; package/development-installation checks passed under both engines.
+The resize, tab-overview, reply-feedback, and mouse-reporting integration cases
+passed, and the visibility regression passed all 18 assertions under both
+engines. Tracked Zig sources passed formatting checks.
+
+These checks validate this merge and its fixes. They do not clear the feature
+parity release gate or replace the missing end-to-end checks in the roadmap.
+
 ### Zig unit tests
 
 From a local Windows checkout:
@@ -495,6 +542,7 @@ bash test/win32/ghostty_test.sh program_window_resize
 bash test/win32/ghostty_test.sh tab_overview
 bash test/win32/ghostty_test.sh reply_feedback
 bash test/win32/ghostty_test.sh mouse_reporting
+bash test/win32/ghostty_test.sh visibility
 ```
 
 The resize test uses a file handshake. The overview test sends messages only
@@ -506,6 +554,9 @@ It covers device attributes, keyboard flags, glyph support/coverage/clearing,
 and clipboard status replies; clipboard access is denied for the test.
 The mouse-reporting test uses WSL Python 3 and zsh to check reporting before a
 disconnect, prompt cleanup, and re-enabling reports for the next application.
+The visibility test uses controlled WSL children and test-owned HWNDs to verify
+mode 2033 across hiding, hidden resizes, tab changes, split zoom,
+minimize/restore, and quick-terminal animation.
 These tests use no desktop-global keyboard/mouse injection. The harness stages the
 app under Windows `%TEMP%`. The `resize` and `window_properties` cases also
 avoid global input.
@@ -547,9 +598,12 @@ powershell.exe -ExecutionPolicy Bypass -File test/win32/test_splits.ps1 -ExePath
 
 This fork tracks `ghostty-org/ghostty` main branch.
 
-Last integrated upstream: `f54340ad7` (2026-10-21). This includes the shared
+Last integrated upstream: `v1.4.0` / `83fb95624` (2026-10-27), including 73
+additional commits after `f54340ad7`. This includes the shared
 terminal fixes, Kitty graphics/render-state and snapshot updates, checksum
-reporting controls, paste protection, and libghostty-vt API updates. Windows
+reporting controls, paste protection, and libghostty-vt API updates, plus the
+release fixes for tmux pane validation, scrollback cursor state, canceled APC
+commands, and shell working-directory reports. Windows
 retains WGL/ConPTY; upstream's GTK EGL/DMABUF presentation path is Linux-specific.
 The toolchain and Windows CI now use Zig 0.17.0 (`-Doptimize=fast` for releases).
 
@@ -566,6 +620,9 @@ git fetch upstream
 git switch -c sync/upstream-YYYY-MM-DD main
 git merge upstream/main
 ```
+
+For a versioned release, merge its exact upstream tag (as for `v1.4.0`) to keep
+the release baseline separate from subsequent development on upstream main.
 
 Optionally enable reusable conflict resolutions in your checkout with
 `git config rerere.enabled true`. Always review reused resolutions too.

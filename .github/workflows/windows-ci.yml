@@ -101,6 +101,16 @@ jobs:
       - name: Build stripped release
         run: .\dist\windows\build.ps1 -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu -Doptimize=fast
 
+      - name: Verify portable payload and version resources (5.1 and 7)
+        shell: pwsh
+        run: |
+          foreach ($engine in @("powershell.exe", "pwsh.exe")) {
+            & $engine -NoProfile -NonInteractive -ExecutionPolicy Bypass -File test/win32/test_package.ps1
+            if ($LASTEXITCODE -ne 0) {
+              throw "Package validation failed under $engine"
+            }
+          }
+
       - name: Test cache maintenance helpers
         run: |
           zig test src/build/cache_guard.zig -target x86_64-windows-gnu
@@ -131,3 +141,6 @@ jobs:
 
       - name: zig fmt
         run: zig fmt --check .
+
+      - name: Test Windows packaging
+        run: python3 test/win32/test_package.py
