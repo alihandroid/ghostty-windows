@@ -5083,6 +5083,13 @@ pub fn cursorPosCallback(
             }
         }
 
+        // Preserve the second press selection until it leaves that cell,
+        // including neighboring-cell double-clicks. Stationary updates must
+        // not replace the URL or arm autoscroll that would replace it later.
+        // An actual drag clears the latch above, even outside the viewport.
+        if (self.mouse.selection_gesture.left_click_count == 2 and
+            self.mouse.double_click_point != null) break :select;
+
         // Perform our drag behavior in our gesture handler.
         const drag_selection = self.mouse.selection_gesture.drag(t, .{
             .pin = pin,
@@ -5113,14 +5120,6 @@ pub fn cursorPosCallback(
                 );
             },
         }
-
-        // Preserve the selection made by the second press until it really
-        // leaves that cell. Position notifications alone must not replace a
-        // whole URL with a word, including when the two presses hit adjacent
-        // cells. Once dragging starts, returning to the cell keeps normal
-        // word-drag behavior. Autoscroll above still updates on every motion.
-        if (self.mouse.selection_gesture.left_click_count == 2 and
-            self.mouse.double_click_point != null) break :select;
 
         // Update our selection based on the gesture state
         try self.setSelection(drag_selection);
@@ -7142,12 +7141,13 @@ test "Surface double-click selection survives stationary motion and still drags"
     try oni.testing.ensureInit();
     const url = "https://example.test/path";
     const Case = struct {
-        kind: enum { url, adjacent, word, single, triple, recycled },
+        kind: enum { url, adjacent, edge, word, single, triple, recycled },
         mods: input.Mods = .{},
     };
     const cases = [_]Case{
         .{ .kind = .url },
         .{ .kind = .adjacent },
+        .{ .kind = .edge },
         .{ .kind = .url, .mods = .{ .shift = true } },
         .{ .kind = .url, .mods = input.ctrlOrSuper(.{}) },
         .{ .kind = .word },
@@ -7208,7 +7208,8 @@ test "Surface double-click selection survives stationary motion and still drags"
             .handler = .init(term),
         });
         defer stream.deinit();
-        stream.nextSlice("header\r\n" ++ url ++ " tail words\r\nnext line words");
+        if (case.kind != .edge) stream.nextSlice("header\r\n");
+        stream.nextSlice(url ++ " tail words\r\nnext line words");
         var mutex: std.Io.Mutex = .init;
         surface.renderer_state = .{ .mutex = &mutex, .terminal = term };
         surface.io.renderer_state = &surface.renderer_state;
@@ -7217,7 +7218,10 @@ test "Surface double-click selection survives stationary motion and still drags"
         surface.io.mailbox = try termio.Mailbox.initSPSC(testing.allocator);
         defer surface.io.mailbox.deinit(testing.allocator);
 
-        const second: apprt.CursorPos = .{ .x = if (case.kind == .word) 285 else 105, .y = 15 };
+        const second: apprt.CursorPos = .{
+            .x = if (case.kind == .word) 285 else 105,
+            .y = if (case.kind == .edge) 0.5 else 15,
+        };
         const first: apprt.CursorPos = if (case.kind == .adjacent)
             .{ .x = 99, .y = 15 }
         else
@@ -7255,6 +7259,16 @@ test "Surface double-click selection survives stationary motion and still drags"
         try testing.expect(surface.mouse.double_click_point != null);
         try testing.expect(!surface.mouse.over_link);
 
+        if (case.kind == .edge) {
+            try testing.expectEqual(terminal.SelectionGesture.Autoscroll.none, surface.mouse.selection_gesture.left_drag_autoscroll);
+            try testing.expect(surface.io.mailbox.spsc.queue.pop(global.io()) == null);
+            try surface.cursorPosCallback(.{ .x = second.x, .y = -1 }, null);
+            try testing.expect(surface.mouse.double_click_point == null);
+            try testing.expectEqual(terminal.SelectionGesture.Autoscroll.up, surface.mouse.selection_gesture.left_drag_autoscroll);
+            const message = surface.io.mailbox.spsc.queue.pop(global.io()).?;
+            try testing.expectEqual(true, message.selection_scroll);
+            continue;
+        }
         if (case.kind == .recycled) {
             _ = try term.switchScreen(.primary);
             term.screens.remove(testing.allocator, .alternate);
