@@ -439,12 +439,36 @@ For immediate recovery, open the command palette with `Ctrl+Shift+P` and select
 **Reset Mouse Reporting**, or bind the `reset_mouse_reporting` action. This
 preserves terminal contents and history.
 
+### Windows transparency
+
+`background-opacity` changes the terminal background, not text, cursors, images,
+or explicit cell backgrounds. Enable `background-opacity-cells` separately to
+make cell backgrounds translucent. `toggle_background_opacity` forces an opaque
+background until toggled back. Reload still updates the configured value while
+forced-opaque mode remains set.
+
+Transparency uses DirectComposition with hardware `WGL_NV_DX_interop2` support.
+The GPU presentation pass writes a stable shared texture, then copies it into
+the DXGI backbuffer; terminal frames are never copied through CPU memory.
+Unsupported presentation drivers emit an explicit transparency-unavailable
+warning and switch to an opaque WGL terminal.
+Tab bars and dividers remain opaque on a separate GDI surface. Native title
+editors share that surface, including when they overlay a single-tab terminal.
+
+`background-blur` requests Desktop Acrylic when configured opacity is below 1.
+`false` or `0` disables it. `true` or any positive integer enables the same
+OS-controlled material: values such as `20` and `50` do not select different
+blur strengths on Windows. Older systems use the accent API when available.
+Windows controls tint and blur radius, and accessibility or power policy can
+suppress the effect. An unavailable blur API produces a warning rather than a
+software substitute.
+
 ## Architecture
 
 The Windows port adds a `win32` application runtime (`src/apprt/win32/`) alongside the existing GTK (Linux) and AppKit (macOS) runtimes. It reuses Ghostty's cross-platform core:
 
 - **Terminal emulation**: Shared VT parser, screen, scrollback (`src/terminal/`)
-- **Rendering**: OpenGL 4.3+ with WGL context management (`src/renderer/`)
+- **Rendering**: OpenGL 4.3+ with WGL context management and hardware DirectComposition presentation (`src/renderer/`)
 - **Fonts**: FreeType rasterization + HarfBuzz shaping + DirectWrite discovery (`src/font/`)
 - **PTY**: Windows ConPTY via `CreatePseudoConsole` (`src/pty.zig`)
 - **I/O**: libxev with IOCP backend (`src/termio/`)
@@ -577,6 +601,27 @@ dark translucent, and light fixtures exercise tab creation, keyboard and mouse
 selection, independent PTY input, right-side closing, and inline title editing.
 JSON results, app logs, and native window captures are saved in the output
 directory. Blur is disabled in these fixtures; this is not a compositing test.
+The native composition regression uses PowerShell 7 and an idle interactive
+desktop. It sends input messages only to validated test-owned HWNDs, without
+global keyboard/mouse injection or foreground requests. Its non-activating
+backdrop and app windows form an owned capture scene; screenshots are actual
+desktop-composited pixels, not PrintWindow output.
+
+```powershell
+pwsh.exe -NoProfile -File test/win32/test_composition.ps1 `
+  -ExePath "$PWD/zig-out/bin/ghostty.exe" `
+  -ResourcesPath "$PWD/zig-out/share/ghostty" `
+  -OutputDirectory "$env:TEMP/ghostty-composition-proof" -Case all
+```
+
+Use `-Case opacity`, `blur`, `creation`, or `lifecycle` for focused checks.
+The harness `toggle_opacity` case invokes the same native opacity regression.
+The fixtures disable resize overlays and update notifications, preserve the
+personal configuration, and reject obscured or focus-changing captures.
+Creation traces cover the incoming frame's actual reveal, with terminal-edge,
+interior, stable tab-chrome, and independent-session input assertions. They
+use upstream tab geometry and do not require the standalone tab-styling PR.
+PNG/JSON evidence and app logs are saved in the output directory.
 
 The PowerShell integration regression test captures VT output in memory and
 needs neither a GUI nor the app binary. Run from the repository root in Windows:

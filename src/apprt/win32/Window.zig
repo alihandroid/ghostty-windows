@@ -26,6 +26,7 @@ app: *App,
 
 /// The top-level window handle.
 hwnd: ?w32.HWND = null,
+chrome_hwnd: ?w32.HWND = null,
 
 /// Tab split trees owned by this window (fixed-capacity inline array).
 tab_count: usize = 0,
@@ -69,6 +70,11 @@ drag_tab: isize = -1,
 drag_start_x: i16 = 0,
 /// Whether the drag has exceeded the threshold and is active.
 drag_active: bool = false,
+
+/// Non-owning HWND resolved against the current trees before each retry.
+pending_tab_reveal: ?w32.HWND = null,
+/// Presentation can lag logical selection; input follows active_tab.
+displayed_tab: ?w32.HWND = null,
 
 /// Inline tab rename: Edit control HWND, font, and target tab index.
 rename_edit: ?w32.HWND = null,
@@ -133,12 +139,16 @@ resize_overlay_hwnd: ?w32.HWND = null,
 /// after-first suppresses the overlay for that first layout pass.
 resize_seen_first: bool = false,
 
+opacity_mode: OpacityMode = .configured,
+transparency_supported: bool = false,
+/// Keep native interop failure latched across config and DWM refreshes.
+native_composition_failed: bool = false,
+
+pub const OpacityMode = enum { configured, forced_opaque };
+
 pub const InitOptions = struct {
     is_quick_terminal: bool = false,
-    /// If true, start fully opaque regardless of `background-opacity`. Set
-    /// when `new_window` inherits from a parent window the user had
-    /// toggled to opaque via `toggle_background_opacity`.
-    force_opaque: bool = false,
+    opacity_mode: OpacityMode = .configured,
 };
 
 /// Read HKCU\...\Themes\Personalize\AppsUseLightTheme. Returns true when the
@@ -205,12 +215,33 @@ fn applyChromeTheme(hwnd: w32.HWND, theme: anytype, bg: anytype) void {
     );
 }
 
-/// Called from App.config_change so the title bar tracks live config
-/// reloads (background color in particular).
-/// Enable/disable the DWM accent blur behind the window (background-blur).
-/// Visible where the window is translucent (background-opacity < 1): the
-/// desktop behind shows blurred instead of sharp, the acrylic-ish look.
-fn applyBackgroundBlur(hwnd: w32.HWND, enabled: bool) void {
+fn applyBackgroundBlur(self: *Window) void {
+    const hwnd = self.hwnd orelse return;
+    var presentation_ready = false;
+    if (self.tab_count > 0) {
+        const tree = self.tab_trees[self.active_tab];
+        var it = tree.iterator();
+        while (it.next()) |entry| {
+            if (tree.zoomed) |zoomed| if (entry.handle != zoomed) continue;
+            if (entry.view.transparency_supported) {
+                presentation_ready = true;
+                break;
+            }
+        }
+    }
+    const enabled = self.transparency_supported and presentation_ready and
+        self.opacity_mode == .configured and
+        self.app.config.@"background-opacity" < 1 and
+        self.app.config.@"background-blur".enabled();
+    const backdrop: u32 = if (enabled) w32.DWMSBT_TRANSIENTWINDOW else w32.DWMSBT_NONE;
+    const result = w32.DwmSetWindowAttribute(
+        hwnd,
+        w32.DWMWA_SYSTEMBACKDROP_TYPE,
+        &backdrop,
+        @sizeOf(u32),
+    );
+    if (result >= 0) return;
+
     var policy: w32.ACCENT_POLICY = .{
         .AccentState = if (enabled) w32.ACCENT_ENABLE_BLURBEHIND else w32.ACCENT_DISABLED,
         .AccentFlags = 0,
@@ -219,18 +250,54 @@ fn applyBackgroundBlur(hwnd: w32.HWND, enabled: bool) void {
     };
     var data: w32.WINDOWCOMPOSITIONATTRIBDATA = .{
         .Attrib = w32.WCA_ACCENT_POLICY,
-        .pvData = @ptrCast(&policy),
+        .pvData = &policy,
         .cbData = @sizeOf(w32.ACCENT_POLICY),
     };
-    _ = w32.SetWindowCompositionAttribute(hwnd, &data);
+    if (w32.SetWindowCompositionAttribute(hwnd, &data) == 0) {
+        log.warn("Windows background blur unavailable (DwmSetWindowAttribute HRESULT=0x{x}, SetWindowCompositionAttribute returned FALSE)", .{@as(u32, @bitCast(result))});
+    }
+}
+
+fn applyComposition(self: *Window) !void {
+    if (self.hwnd == null) return;
+    var enabled: w32.BOOL = .FALSE;
+    const status = w32.DwmIsCompositionEnabled(&enabled);
+    self.transparency_supported = status >= 0 and enabled.toBool() and
+        !self.native_composition_failed;
+    if (self.native_composition_failed) {
+        log.warn("DirectComposition unavailable; using an opaque background", .{});
+    } else if (!self.transparency_supported) {
+        if (status < 0) log.warn("Windows transparency unavailable; using an opaque background (DwmIsCompositionEnabled HRESULT=0x{x})", .{@as(u32, @bitCast(status))}) else log.warn("Windows transparency unavailable; using an opaque background (DWM composition disabled)", .{});
+    }
+    self.refreshOpacity();
 }
 
 pub fn onConfigChange(self: *Window) void {
-    if (self.hwnd) |hwnd| {
-        applyChromeTheme(hwnd, self.app.config.@"window-theme", self.app.config.background);
-        applyBackgroundBlur(hwnd, self.app.config.@"background-blur".enabled());
+    if (self.hwnd) |hwnd| applyChromeTheme(hwnd, self.app.config.@"window-theme", self.app.config.background);
+    self.applyComposition() catch |err| log.warn("composition setup failed: {}", .{err});
+    self.layoutSplits();
+    self.invalidateTabBar();
+}
+
+pub fn refreshOpacity(self: *Window) void {
+    self.applyBackgroundBlur();
+    var tab: usize = 0;
+    while (tab < self.tab_count) : (tab += 1) {
+        var it = self.tab_trees[tab].iterator();
+        while (it.next()) |entry| {
+            const surface = entry.view;
+            if (!surface.core_surface_ready) continue;
+            surface.core_surface.setBackgroundOpacityOverride(surface.backgroundOpacityOverride()) catch |err| {
+                log.warn("opacity override failed surface={*} err={}", .{ surface, err });
+            };
+        }
     }
     self.tab_overview.updateAppearance();
+}
+
+pub fn surfaceHwndReplaced(self: *Window, old: w32.HWND, new: w32.HWND) void {
+    if (self.displayed_tab == old) self.displayed_tab = new;
+    if (self.pending_tab_reveal == old) self.pending_tab_reveal = new;
 }
 
 /// Initialize the Window by creating the top-level HWND and tab bar font.
@@ -238,16 +305,17 @@ pub fn init(self: *Window, app: *App, options: InitOptions) !void {
     self.* = .{
         .app = app,
         .is_quick_terminal = options.is_quick_terminal,
+        .opacity_mode = options.opacity_mode,
     };
 
-    const style: u32 = if (options.is_quick_terminal)
+    const style: u32 = (if (options.is_quick_terminal)
         w32.WS_POPUP
     else if (app.config.@"window-decoration" == .none)
-        // Borderless but still resizable: thin sizing frame, no title bar.
         w32.WS_POPUP | w32.WS_THICKFRAME
     else
-        w32.WS_OVERLAPPEDWINDOW;
-    const ex_style: u32 = if (options.is_quick_terminal) w32.WS_EX_TOOLWINDOW else 0;
+        w32.WS_OVERLAPPEDWINDOW) | w32.WS_CLIPCHILDREN;
+    const ex_style: u32 = w32.WS_EX_NOREDIRECTIONBITMAP |
+        (if (options.is_quick_terminal) w32.WS_EX_TOOLWINDOW else 0);
 
     // Cascade non-quick-terminal windows: stack each new window 30px
     // down/right of the most recently created window. Stops once the
@@ -309,13 +377,37 @@ pub fn init(self: *Window, app: *App, options: InitOptions) !void {
 
     self.hwnd = hwnd;
     errdefer {
+        if (self.chrome_hwnd) |chrome| {
+            _ = w32.SetWindowLongPtrW(chrome, w32.GWLP_USERDATA, 0);
+            _ = w32.DestroyWindow(chrome);
+            self.chrome_hwnd = null;
+        }
         _ = w32.DestroyWindow(hwnd);
         self.hwnd = null;
     }
-
-    // Store the Window pointer in GWLP_USERDATA for the WndProc.
+    const chrome = w32.CreateWindowExW(
+        w32.WS_EX_LAYERED,
+        App.CHROME_CLASS_NAME,
+        std.unicode.utf8ToUtf16LeStringLiteral(""),
+        w32.WS_CHILD | w32.WS_VISIBLE_STYLE | w32.WS_CLIPCHILDREN,
+        0,
+        0,
+        0,
+        0,
+        hwnd,
+        null,
+        app.hinstance,
+        null,
+    ) orelse return error.Win32Error;
+    self.chrome_hwnd = chrome;
+    // Give GDI chrome its own redirection surface under the nonredirected parent.
+    if (w32.SetLayeredWindowAttributes(chrome, 0, 255, w32.LWA_ALPHA) == 0)
+        return error.Win32Error;
     _ = w32.SetWindowLongPtrW(hwnd, w32.GWLP_USERDATA, @bitCast(@intFromPtr(self)));
+    _ = w32.SetWindowLongPtrW(chrome, w32.GWLP_USERDATA, @bitCast(@intFromPtr(self)));
+    self.updateChromeRegion();
 
+    self.applyComposition() catch |err| log.warn("composition setup failed: {}", .{err});
     applyChromeTheme(hwnd, app.config.@"window-theme", app.config.background);
 
     // Apply dark theme to common controls (scrollbar, etc.).
@@ -324,19 +416,6 @@ pub fn init(self: *Window, app: *App, options: InitOptions) !void {
         std.unicode.utf8ToUtf16LeStringLiteral("DarkMode_Explorer"),
         null,
     );
-
-    // If background opacity is less than 1.0, make the window transparent.
-    // Skip when force_opaque (parent window was toggled to opaque via
-    // toggle_background_opacity — inherit that state for the new window).
-    if (app.config.@"background-opacity" < 1.0 and !options.force_opaque) {
-        const current_ex = w32.GetWindowLongW(hwnd, w32.GWL_EXSTYLE);
-        _ = w32.SetWindowLongW(hwnd, w32.GWL_EXSTYLE, current_ex | w32.WS_EX_LAYERED);
-        const alpha: u8 = @intFromFloat(@round(app.config.@"background-opacity" * 255.0));
-        _ = w32.SetLayeredWindowAttributes(hwnd, 0, alpha, w32.LWA_ALPHA);
-    }
-    if (app.config.@"background-blur".enabled()) {
-        applyBackgroundBlur(hwnd, true);
-    }
 
     // Query DPI scale.
     const dpi = w32.GetDpiForWindow(hwnd);
@@ -369,19 +448,44 @@ pub fn init(self: *Window, app: *App, options: InitOptions) !void {
     // timing issues with ConPTY.
 }
 
-/// Deinitialize the Window: close all tabs, delete font, destroy HWND.
+fn handleDpiChange(self: *Window) void {
+    const hwnd = self.hwnd orelse return;
+    const dpi = w32.GetDpiForWindow(hwnd);
+    if (dpi == 0) return;
+    self.scale = @as(f32, @floatFromInt(dpi)) / 96.0;
+    if (self.tab_font) |font| _ = w32.DeleteObject(font);
+    self.tab_font = w32.CreateFontW(
+        -@as(i32, @intFromFloat(16.0 * self.scale)),
+        0,
+        0,
+        0,
+        w32.FW_NORMAL,
+        0,
+        0,
+        0,
+        w32.DEFAULT_CHARSET,
+        0,
+        0,
+        0,
+        0,
+        std.unicode.utf8ToUtf16LeStringLiteral("Segoe UI"),
+    );
+    self.handleResize();
+}
+
+/// Deinitialize the Window: close all tabs, delete font, destroy HWNDs.
 pub fn deinit(self: *Window) void {
     self.tab_overview.deinit();
-    // Close all tab surfaces.
     self.cleanupAllSurfaces();
-
-    // Delete the tab bar font.
     if (self.tab_font) |font| {
         _ = w32.DeleteObject(font);
         self.tab_font = null;
     }
-
-    // Clear GWLP_USERDATA before destroying to prevent stale pointer access.
+    if (self.chrome_hwnd) |chrome| {
+        _ = w32.SetWindowLongPtrW(chrome, w32.GWLP_USERDATA, 0);
+        _ = w32.DestroyWindow(chrome);
+        self.chrome_hwnd = null;
+    }
     if (self.hwnd) |hwnd| {
         _ = w32.SetWindowLongPtrW(hwnd, w32.GWLP_USERDATA, 0);
         _ = w32.DestroyWindow(hwnd);
@@ -486,8 +590,13 @@ pub fn addTabWithOptions(self: *Window, options: AddTabOptions) !*Surface {
     const default_title = std.unicode.utf8ToUtf16LeStringLiteral("Ghostty");
     @memcpy(self.tab_titles[pos][0..default_title.len], default_title);
     self.tab_title_lens[pos] = @intCast(default_title.len);
+    // Prepare the incoming frame at its final geometry before revealing it.
+    self.tab_bar_visible = self.shouldShowTabBar();
 
     if (self.tab_count == 1) {
+        self.active_tab = pos;
+        self.displayed_tab = surface.hwnd;
+        self.layoutSplits();
         // First tab — show the parent window now that the terminal is ready.
         // Quick terminal windows are shown by QuickTerminal.animateIn() instead.
         if (!self.is_quick_terminal) {
@@ -496,7 +605,6 @@ pub fn addTabWithOptions(self: *Window, options: AddTabOptions) !*Surface {
                 _ = w32.UpdateWindow(h);
             }
         }
-        self.active_tab = pos;
         self.updateWindowTitle();
         // Set keyboard focus to the child surface so it receives input.
         if (!self.is_quick_terminal) {
@@ -573,6 +681,7 @@ fn closeTabByIndex(self: *Window, idx: usize) void {
     }
     self.tab_count -= 1;
     if (self.tab_count == 0) {
+        self.updateChromeRegion();
         self.closing = true;
         self.tab_overview.hide(false);
         if (self.hwnd) |hwnd| _ = w32.PostMessageW(hwnd, w32.WM_CLOSE, 0, 0);
@@ -679,6 +788,12 @@ fn isVisible(self: *const Window) bool {
     return w32.IsWindowVisible_(hwnd) != 0 and w32.IsIconic(hwnd) == 0;
 }
 
+pub fn onSurfaceFocus(self: *Window, surface: *Surface) void {
+    const idx = self.findTabIndex(surface) orelse return;
+    self.tab_active_surface[idx] = surface;
+    if (idx != self.active_tab) self.selectTabIndex(idx);
+}
+
 /// Publish parent visibility without exposing panes hidden by split zoom.
 fn setActiveTabVisible(self: *Window, visible: bool) void {
     if (self.active_tab >= self.tab_count) return;
@@ -687,11 +802,21 @@ fn setActiveTabVisible(self: *Window, visible: bool) void {
     while (it.next()) |entry| {
         entry.view.setVisible(visible and (tree.zoomed == null or entry.handle == tree.zoomed.?));
     }
+    if (self.displayedTabIndex()) |displayed| {
+        if (displayed != self.active_tab) {
+            const displayed_tree = self.tab_trees[displayed];
+            it = displayed_tree.iterator();
+            while (it.next()) |entry| {
+                entry.view.setVisible(visible and (displayed_tree.zoomed == null or entry.handle == displayed_tree.zoomed.?));
+            }
+        }
+    }
 }
 
 /// Switch to the tab at the given index.
 pub fn selectTabIndex(self: *Window, idx: usize) void {
     if (idx >= self.tab_count) return;
+    self.cancelPendingTabReveal(idx);
     self.cancelTabRename();
     // Clear any in-progress tab drag
     if (self.drag_tab >= 0) {
@@ -699,18 +824,39 @@ pub fn selectTabIndex(self: *Window, idx: usize) void {
         self.drag_active = false;
         _ = w32.ReleaseCapture();
     }
-    if (self.active_tab < self.tab_count) {
-        var it = self.tab_trees[self.active_tab].iterator();
-        while (it.next()) |entry| {
-            entry.view.setVisible(false);
-            if (entry.view.hwnd) |h| _ = w32.ShowWindow(h, w32.SW_HIDE);
-        }
-    }
+    const previous = self.displayedTabIndex() orelse self.active_tab;
     self.active_tab = idx;
+    if (!self.prepareTabReveal(idx)) {
+        self.pending_tab_reveal = self.tab_active_surface[idx].hwnd;
+        if (self.hwnd) |h| {
+            if (w32.SetTimer(h, TAB_REVEAL_TIMER_ID, 10, null) == 0) {
+                self.cancelPendingTabReveal(null);
+                log.warn("could not schedule incoming tab reveal", .{});
+            }
+        }
+        if (self.tab_active_surface[idx].hwnd) |h| _ = w32.SetFocus(h);
+        self.updateWindowTitle();
+        return;
+    }
+    if (previous < self.tab_count and previous != idx) {
+        var it = self.tab_trees[previous].iterator();
+        while (it.next()) |entry| entry.view.setVisible(false);
+    }
+    self.swapTabVisibility(previous, idx) catch |err| {
+        log.warn("tab visibility transaction failed err={}", .{err});
+        if (previous < self.tab_count and previous != idx) {
+            var it = self.tab_trees[previous].iterator();
+            while (it.next()) |entry| {
+                if (entry.view.hwnd) |h| _ = w32.ShowWindow(h, w32.SW_HIDE);
+            }
+        }
+    };
     const surface = self.tab_active_surface[idx];
+    self.displayed_tab = surface.hwnd;
     self.layoutSplits();
     // An inactive child can exit while the user is searching. Keep focus
     // in the overview; explicit activation hides it before selecting.
+    if (self.chrome_hwnd) |chrome| _ = w32.UpdateWindow(chrome);
     if (!self.tab_overview.active) {
         if (surface.hwnd) |h| _ = w32.SetFocus(h);
     }
@@ -718,11 +864,143 @@ pub fn selectTabIndex(self: *Window, idx: usize) void {
     self.invalidateTabBar();
 }
 
+const TAB_REVEAL_TIMER_ID: usize = 0x5452;
+
+fn tabIndexForHwnd(self: *const Window, handle: ?w32.HWND) ?usize {
+    const hwnd = handle orelse return null;
+    for (0..self.tab_count) |idx| {
+        var it = self.tab_trees[idx].iterator();
+        while (it.next()) |entry| {
+            if (entry.view.hwnd == hwnd) return idx;
+        }
+    }
+    return null;
+}
+
+fn displayedTabIndex(self: *Window) ?usize {
+    if (self.tabIndexForHwnd(self.displayed_tab)) |idx| return idx;
+    // A split pane can exit while another pane still displays this tab.
+    for (0..self.tab_count) |idx| {
+        var it = self.tab_trees[idx].iterator();
+        while (it.next()) |entry| {
+            const hwnd = entry.view.hwnd orelse continue;
+            if (w32.GetWindowLongW(hwnd, w32.GWL_STYLE) & w32.WS_VISIBLE_STYLE == 0) continue;
+            self.displayed_tab = hwnd;
+            return idx;
+        }
+    }
+    return null;
+}
+
+fn pendingTabIndex(self: *const Window) ?usize {
+    return self.tabIndexForHwnd(self.pending_tab_reveal);
+}
+
+fn cancelPendingTabReveal(self: *Window, next: ?usize) void {
+    if (self.pending_tab_reveal == null) return;
+    if (self.pendingTabIndex()) |idx| {
+        if (self.displayedTabIndex() != idx and next != idx) {
+            var it = self.tab_trees[idx].iterator();
+            while (it.next()) |entry| entry.view.setVisible(false);
+        }
+    }
+    self.pending_tab_reveal = null;
+    if (self.hwnd) |h| _ = w32.KillTimer(h, TAB_REVEAL_TIMER_ID);
+}
+
+fn tabFramesReady(self: *const Window, idx: usize) bool {
+    const tree = self.tab_trees[idx];
+    var it = tree.iterator();
+    while (it.next()) |entry| {
+        if (tree.zoomed) |zoomed| if (entry.handle != zoomed) continue;
+        if (!entry.view.hasPresentedFrame()) return false;
+    }
+    return true;
+}
+
+fn prepareTabReveal(self: *Window, idx: usize) bool {
+    const tree = self.tab_trees[idx];
+    var it = tree.iterator();
+    var hidden = false;
+    while (it.next()) |entry| {
+        if (tree.zoomed) |zoomed| if (entry.handle != zoomed) continue;
+        if (entry.view.hwnd) |h| {
+            if (w32.GetWindowLongW(h, w32.GWL_STYLE) & w32.WS_VISIBLE_STYLE == 0) hidden = true;
+        }
+    }
+    if (!hidden) return true;
+
+    // Size and present hidden children before removing the outgoing frame.
+    self.layoutNode(tree, tree.zoomed orelse .root, self.surfaceRect(), false);
+    if (self.tabFramesReady(idx)) return true;
+    it = tree.iterator();
+    while (it.next()) |entry| {
+        if (tree.zoomed) |zoomed| if (entry.handle != zoomed) continue;
+        const view = entry.view;
+        if (!view.core_surface_ready) continue;
+        if (view.frame_event) |event| _ = w32.ResetEvent(event);
+        const already_visible = view.last_reported_visible == true;
+        view.setVisible(true);
+        if (already_visible) view.core_surface.renderer_thread.wakeup.notify() catch |err| {
+            log.warn("tab reveal wakeup failed err={}", .{err});
+        };
+    }
+    // Share one frame budget across panes, including a stalled renderer.
+    const started = w32.GetTickCount64();
+    it = tree.iterator();
+    while (it.next()) |entry| {
+        if (tree.zoomed) |zoomed| if (entry.handle != zoomed) continue;
+        const elapsed = w32.GetTickCount64() - started;
+        if (elapsed >= 16) break;
+        if (entry.view.frame_event) |event| _ = w32.WaitForSingleObject(event, @intCast(16 - elapsed));
+    }
+    return self.tabFramesReady(idx);
+}
+
+fn swapTabVisibility(self: *Window, previous: usize, next: usize) !void {
+    var count: i32 = 0;
+    if (previous < self.tab_count and previous != next) {
+        var it = self.tab_trees[previous].iterator();
+        while (it.next()) |entry| {
+            if (entry.view.hwnd != null) count += 1;
+        }
+    }
+    const tree = self.tab_trees[next];
+    var it = tree.iterator();
+    while (it.next()) |entry| {
+        if (entry.view.hwnd != null) count += 1;
+    }
+    var batch = w32.BeginDeferWindowPos(count) orelse return error.Win32Error;
+    const flags = w32.SWP_NOMOVE | w32.SWP_NOSIZE | w32.SWP_NOZORDER | w32.SWP_NOACTIVATE;
+    if (previous < self.tab_count and previous != next) {
+        var old = self.tab_trees[previous].iterator();
+        while (old.next()) |entry| {
+            const h = entry.view.hwnd orelse continue;
+            batch = w32.DeferWindowPos(batch, h, null, 0, 0, 0, 0, flags | w32.SWP_HIDEWINDOW) orelse return error.Win32Error;
+        }
+    }
+    it = tree.iterator();
+    while (it.next()) |entry| {
+        const h = entry.view.hwnd orelse continue;
+        const visible = if (tree.zoomed) |zoomed| entry.handle == zoomed else true;
+        batch = w32.DeferWindowPos(batch, h, null, 0, 0, 0, 0, flags | (if (visible) w32.SWP_SHOWWINDOW else w32.SWP_HIDEWINDOW)) orelse return error.Win32Error;
+    }
+    if (w32.EndDeferWindowPos(batch) == 0) return error.Win32Error;
+}
+
 /// Layout split panes for the active tab.
 pub fn layoutSplits(self: *Window) void {
-    if (self.tab_count == 0) return;
+    if (self.tab_count == 0) {
+        self.updateChromeRegion();
+        self.applyBackgroundBlur();
+        return;
+    }
     const tree = self.tab_trees[self.active_tab];
     const rect = self.surfaceRect();
+    if (self.pending_tab_reveal != null) {
+        self.layoutNode(tree, tree.zoomed orelse .root, rect, false);
+        return;
+    }
     if (tree.zoomed) |zoomed_handle| {
         var it = tree.iterator();
         while (it.next()) |entry| {
@@ -739,31 +1017,117 @@ pub fn layoutSplits(self: *Window) void {
                 if (entry.view.hwnd) |h| _ = w32.ShowWindow(h, w32.SW_HIDE);
             }
         }
+        self.updateChromeRegion();
+        self.applyBackgroundBlur();
         return;
     }
-    self.layoutNode(tree, .root, rect);
-
-    // Paint divider lines directly using GetDC (not BeginPaint, which
-    // clips to the invalid region and misses the content area gaps).
-    if (self.hwnd) |hwnd| {
-        const hdc = w32.GetDC(hwnd);
-        if (hdc) |dc| {
-            self.paintDividers(dc);
-            _ = w32.ReleaseDC(hwnd, dc);
-        }
-    }
+    self.layoutNode(tree, .root, rect, true);
+    self.updateChromeRegion();
+    self.applyBackgroundBlur();
 }
 
-fn layoutNode(self: *Window, tree: SplitTree(Surface), handle: SplitTree(Surface).Node.Handle, rect: w32.RECT) void {
+fn updateChromeRegion(self: *Window) void {
+    const parent = self.hwnd orelse return;
+    const chrome = self.chrome_hwnd orelse return;
+    var client: w32.RECT = undefined;
+    if (w32.GetClientRect(parent, &client) == 0) return;
+    const width = client.right - client.left;
+    const height = client.bottom - client.top;
+    const flags = w32.SWP_NOACTIVATE | (if (self.rename_edit == null) w32.SWP_NOZORDER else @as(u32, 0));
+    if (w32.SetWindowPos(chrome, null, 0, 0, width, height, flags) == 0) {
+        log.warn("could not size composition chrome", .{});
+        return;
+    }
+
+    const region = w32.CreateRectRgn(0, 0, width, height) orelse {
+        log.warn("could not allocate composition chrome region", .{});
+        return;
+    };
+    var owned = false;
+    defer {
+        if (!owned) _ = w32.DeleteObject(region);
+    }
+    if (self.tab_count > 0) {
+        const displayed = self.displayedTabIndex() orelse self.active_tab;
+        const tree = self.tab_trees[displayed];
+        var it = tree.iterator();
+        while (it.next()) |entry| {
+            if (tree.zoomed) |zoomed| if (entry.handle != zoomed) continue;
+            const child = entry.view.hwnd orelse continue;
+            if (w32.GetWindowLongW(child, w32.GWL_STYLE) & w32.WS_VISIBLE_STYLE == 0) continue;
+            var rect: w32.RECT = undefined;
+            if (w32.GetWindowRect(child, &rect) == 0) {
+                log.warn("could not locate composition child", .{});
+                return;
+            }
+            var points = [2]w32.POINT{
+                .{ .x = rect.left, .y = rect.top },
+                .{ .x = rect.right, .y = rect.bottom },
+            };
+            w32.SetLastError(0);
+            if (w32.MapWindowPoints(null, chrome, &points[0], 2) == 0 and
+                std.os.windows.GetLastError() != .SUCCESS)
+            {
+                log.warn("could not map composition child rectangle", .{});
+                return;
+            }
+            const hole = w32.CreateRectRgn(points[0].x, points[0].y, points[1].x, points[1].y) orelse {
+                log.warn("could not allocate composition child region", .{});
+                return;
+            };
+            defer _ = w32.DeleteObject(hole);
+            if (w32.CombineRgn(region, region, hole, w32.RGN_DIFF) == 0) {
+                log.warn("could not exclude composition child region", .{});
+                return;
+            }
+        }
+    }
+    if (self.rename_edit) |edit| {
+        // Single-tab window-title editing can overlap a terminal.
+        var rect: w32.RECT = undefined;
+        if (w32.GetWindowRect(edit, &rect) == 0) {
+            log.warn("could not locate composition title editor", .{});
+            return;
+        }
+        var points = [2]w32.POINT{
+            .{ .x = rect.left, .y = rect.top },
+            .{ .x = rect.right, .y = rect.bottom },
+        };
+        w32.SetLastError(0);
+        if (w32.MapWindowPoints(null, chrome, &points[0], 2) == 0 and
+            std.os.windows.GetLastError() != .SUCCESS)
+        {
+            log.warn("could not map composition title editor", .{});
+            return;
+        }
+        const overlay = w32.CreateRectRgn(points[0].x, points[0].y, points[1].x, points[1].y) orelse {
+            log.warn("could not allocate composition title editor region", .{});
+            return;
+        };
+        defer _ = w32.DeleteObject(overlay);
+        if (w32.CombineRgn(region, region, overlay, w32.RGN_OR) == 0) {
+            log.warn("could not include composition title editor region", .{});
+            return;
+        }
+    }
+    if (w32.SetWindowRgn(chrome, region, 1) != 0) {
+        owned = true;
+    } else {
+        log.warn("could not apply composition chrome region", .{});
+    }
+    _ = w32.InvalidateRect(chrome, null, 1);
+}
+
+fn layoutNode(self: *Window, tree: SplitTree(Surface), handle: SplitTree(Surface).Node.Handle, rect: w32.RECT, show: bool) void {
     if (handle.idx() >= tree.nodes.len) return;
     switch (tree.nodes[handle.idx()]) {
         .leaf => |view| {
-            view.setVisible(self.isVisible());
+            if (show) view.setVisible(self.isVisible());
             if (view.hwnd) |h| {
                 const w = @max(rect.right - rect.left, 1);
                 const ht = @max(rect.bottom - rect.top, 1);
-                _ = w32.MoveWindow(h, rect.left, rect.top, @intCast(w), @intCast(ht), 1);
-                _ = w32.ShowWindow(h, w32.SW_SHOW);
+                _ = w32.MoveWindow(h, rect.left, rect.top, @intCast(w), @intCast(ht), @intFromBool(show));
+                if (show) _ = w32.ShowWindow(h, w32.SW_SHOW);
             }
         },
         .split => |s| {
@@ -773,15 +1137,15 @@ fn layoutNode(self: *Window, tree: SplitTree(Surface), handle: SplitTree(Surface
                 const split_x = rect.left + @as(i32, @intFromFloat(@as(f32, @floatCast(s.ratio)) * @as(f32, @floatFromInt(total_w))));
                 const left_rect = w32.RECT{ .left = rect.left, .top = rect.top, .right = split_x - @divTrunc(gap, 2), .bottom = rect.bottom };
                 const right_rect = w32.RECT{ .left = split_x + @divTrunc(gap + 1, 2), .top = rect.top, .right = rect.right, .bottom = rect.bottom };
-                self.layoutNode(tree, s.left, left_rect);
-                self.layoutNode(tree, s.right, right_rect);
+                self.layoutNode(tree, s.left, left_rect, show);
+                self.layoutNode(tree, s.right, right_rect, show);
             } else {
                 const total_h = rect.bottom - rect.top;
                 const split_y = rect.top + @as(i32, @intFromFloat(@as(f32, @floatCast(s.ratio)) * @as(f32, @floatFromInt(total_h))));
                 const top_rect = w32.RECT{ .left = rect.left, .top = rect.top, .right = rect.right, .bottom = split_y - @divTrunc(gap, 2) };
                 const bottom_rect = w32.RECT{ .left = rect.left, .top = split_y + @divTrunc(gap + 1, 2), .right = rect.right, .bottom = rect.bottom };
-                self.layoutNode(tree, s.left, top_rect);
-                self.layoutNode(tree, s.right, bottom_rect);
+                self.layoutNode(tree, s.left, top_rect, show);
+                self.layoutNode(tree, s.right, bottom_rect, show);
             }
         },
     }
@@ -797,6 +1161,20 @@ fn paintDividers(self: *Window, hdc: w32.HDC) void {
     self.paintDividerNode(hdc, tree, .root, rect);
 }
 
+fn dividerBitmapInfo() w32.BITMAPINFO {
+    return .{ .bmiHeader = .{
+        .biWidth = 1,
+        .biHeight = -1,
+        .biPlanes = 1,
+        .biBitCount = 32,
+        .biCompression = w32.BI_RGB,
+        .biSizeImage = 4,
+        .biXPelsPerMeter = 0,
+        .biYPelsPerMeter = 0,
+        .biClrUsed = 0,
+        .biClrImportant = 0,
+    } };
+}
 fn paintDividerNode(self: *Window, hdc: w32.HDC, tree: SplitTree(Surface), handle: SplitTree(Surface).Node.Handle, rect: w32.RECT) void {
     if (handle.idx() >= tree.nodes.len) return;
     switch (tree.nodes[handle.idx()]) {
@@ -805,16 +1183,12 @@ fn paintDividerNode(self: *Window, hdc: w32.HDC, tree: SplitTree(Surface), handl
             const gap: i32 = @intFromFloat(@round(5.0 * self.scale));
             const line_w: i32 = @max(@as(i32, @intFromFloat(@round(1.0 * self.scale))), 1);
 
-            const pen = w32.CreatePen(0, line_w, 0x00808080) orelse return;
-            defer _ = w32.DeleteObject(pen);
-            const old_pen = w32.SelectObject(hdc, pen);
-            defer _ = w32.SelectObject(hdc, old_pen);
-
             if (s.layout == .horizontal) {
                 const total_w = rect.right - rect.left;
                 const split_x = rect.left + @as(i32, @intFromFloat(@as(f32, @floatCast(s.ratio)) * @as(f32, @floatFromInt(total_w))));
-                _ = w32.MoveToEx(hdc, split_x, rect.top, null);
-                _ = w32.LineTo(hdc, split_x, rect.bottom);
+                const pixel = [_]u8{ 0x80, 0x80, 0x80, 0xFF };
+                const info = dividerBitmapInfo();
+                _ = w32.StretchDIBits(hdc, split_x - @divTrunc(line_w, 2), rect.top, line_w, rect.bottom - rect.top, 0, 0, 1, 1, &pixel, &info, w32.DIB_RGB_COLORS, w32.SRCCOPY);
                 const left_rect = w32.RECT{ .left = rect.left, .top = rect.top, .right = split_x - @divTrunc(gap, 2), .bottom = rect.bottom };
                 const right_rect = w32.RECT{ .left = split_x + @divTrunc(gap + 1, 2), .top = rect.top, .right = rect.right, .bottom = rect.bottom };
                 self.paintDividerNode(hdc, tree, s.left, left_rect);
@@ -822,8 +1196,9 @@ fn paintDividerNode(self: *Window, hdc: w32.HDC, tree: SplitTree(Surface), handl
             } else {
                 const total_h = rect.bottom - rect.top;
                 const split_y = rect.top + @as(i32, @intFromFloat(@as(f32, @floatCast(s.ratio)) * @as(f32, @floatFromInt(total_h))));
-                _ = w32.MoveToEx(hdc, rect.left, split_y, null);
-                _ = w32.LineTo(hdc, rect.right, split_y);
+                const pixel = [_]u8{ 0x80, 0x80, 0x80, 0xFF };
+                const info = dividerBitmapInfo();
+                _ = w32.StretchDIBits(hdc, rect.left, split_y - @divTrunc(line_w, 2), rect.right - rect.left, line_w, 0, 0, 1, 1, &pixel, &info, w32.DIB_RGB_COLORS, w32.SRCCOPY);
                 const top_rect = w32.RECT{ .left = rect.left, .top = rect.top, .right = rect.right, .bottom = split_y - @divTrunc(gap, 2) };
                 const bottom_rect = w32.RECT{ .left = rect.left, .top = split_y + @divTrunc(gap + 1, 2), .right = rect.right, .bottom = rect.bottom };
                 self.paintDividerNode(hdc, tree, s.left, top_rect);
@@ -1110,7 +1485,7 @@ pub fn moveTabToNewWindow(self: *Window, surface: *Surface) !bool {
 
     const alloc = self.app.core_app.alloc;
     const destination = try alloc.create(Window);
-    destination.init(self.app, .{}) catch |err| {
+    destination.init(self.app, .{ .opacity_mode = self.opacity_mode }) catch |err| {
         alloc.destroy(destination);
         return err;
     };
@@ -1163,6 +1538,7 @@ pub fn moveTabToNewWindow(self: *Window, surface: *Surface) !bool {
 
     var it = destination.tab_trees[0].iterator();
     while (it.next()) |entry| entry.view.parent_window = destination;
+    destination.refreshOpacity();
 
     self.selectTabIndex(self.active_tab);
     self.updateTabBarVisibility();
@@ -1277,18 +1653,18 @@ pub fn onTabTitleChanged(self: *Window, surface: *Surface, title: [:0]const u8) 
     self.invalidateTabBar();
 }
 
-/// Update tab bar visibility based on config and tab count.
-fn updateTabBarVisibility(self: *Window) void {
-    if (self.is_quick_terminal) {
-        self.tab_bar_visible = false;
-        return;
-    }
-    const show_config = self.app.config.@"window-show-tab-bar";
-    const should_show = switch (show_config) {
+fn shouldShowTabBar(self: *const Window) bool {
+    if (self.is_quick_terminal) return false;
+    return switch (self.app.config.@"window-show-tab-bar") {
         .always => true,
         .auto => self.tab_count > 1,
         .never => false,
     };
+}
+
+/// Update tab bar visibility based on config and tab count.
+fn updateTabBarVisibility(self: *Window) void {
+    const should_show = self.shouldShowTabBar();
     if (should_show != self.tab_bar_visible) {
         self.tab_bar_visible = should_show;
         self.handleResize();
@@ -1300,6 +1676,10 @@ pub fn invalidateTabBar(self: *Window) void {
     const hwnd = self.hwnd orelse return;
     if (self.tab_overview.active and !self.overview_refresh_pending) {
         self.overview_refresh_pending = w32.PostMessageW(hwnd, WM_REFRESH_TAB_OVERVIEW, 0, 0) != 0;
+    }
+    if (self.chrome_hwnd) |chrome| {
+        _ = w32.InvalidateRect(chrome, null, 1);
+        return;
     }
     var rect = w32.RECT{
         .left = 0,
@@ -1387,15 +1767,16 @@ fn tabCloseRect(self: *const Window, tab: w32.RECT) w32.RECT {
 
 /// Paint the tab bar using double-buffered GDI painting.
 /// Draws tab backgrounds, text labels, close buttons (x), and the new-tab (+) button.
-fn paintTabBar(self: *Window) void {
-    const hwnd = self.hwnd orelse return;
-
+fn paintTabBar(self: *Window, hwnd: w32.HWND) void {
     var ps: w32.PAINTSTRUCT = undefined;
     const hdc_screen = w32.BeginPaint(hwnd, &ps) orelse return;
     defer _ = w32.EndPaint(hwnd, &ps);
 
     // If the tab bar is not visible, just validate the region and return.
-    if (!self.tab_bar_visible) return;
+    if (!self.tab_bar_visible) {
+        self.paintDividers(hdc_screen);
+        return;
+    }
 
     const bar_h = self.tabBarHeight();
     if (bar_h <= 0) return;
@@ -1406,10 +1787,8 @@ fn paintTabBar(self: *Window) void {
     const client_w = client_rect.right - client_rect.left;
     if (client_w <= 0) return;
 
-    // Double-buffer: create offscreen DC and bitmap.
     const mem_dc = w32.CreateCompatibleDC(hdc_screen) orelse return;
     defer _ = w32.DeleteDC(mem_dc);
-
     const mem_bmp = w32.CreateCompatibleBitmap(hdc_screen, client_w, bar_h) orelse return;
     const old_bmp = w32.SelectObject(mem_dc, mem_bmp);
     defer {
@@ -1555,8 +1934,8 @@ fn paintTabBar(self: *Window) void {
         );
     }
 
-    // --- BitBlt to screen ---
     _ = w32.BitBlt(hdc_screen, 0, 0, client_w, bar_h, mem_dc, 0, 0, w32.SRCCOPY);
+    self.paintDividers(hdc_screen);
 }
 
 /// Honor a program's CSI 8 t resize only when it owns the whole window.
@@ -1656,7 +2035,7 @@ pub fn toggleFullscreen(self: *Window) void {
     if (!self.is_fullscreen) {
         self.saved_style = w32.GetWindowLongW(hwnd, w32.GWL_STYLE);
         _ = w32.GetWindowRect(hwnd, &self.saved_rect);
-        _ = w32.SetWindowLongW(hwnd, w32.GWL_STYLE, w32.WS_POPUP | w32.WS_VISIBLE_STYLE);
+        _ = w32.SetWindowLongW(hwnd, w32.GWL_STYLE, w32.WS_POPUP | w32.WS_VISIBLE_STYLE | w32.WS_CLIPCHILDREN);
         const monitor = w32.MonitorFromWindow(hwnd, w32.MONITOR_DEFAULTTONEAREST);
         var mi: w32.MONITORINFO = undefined;
         mi.cbSize = @sizeOf(w32.MONITORINFO);
@@ -1664,7 +2043,7 @@ pub fn toggleFullscreen(self: *Window) void {
             _ = w32.SetWindowPos(hwnd, null, mi.rcMonitor.left, mi.rcMonitor.top, mi.rcMonitor.right - mi.rcMonitor.left, mi.rcMonitor.bottom - mi.rcMonitor.top, w32.SWP_NOZORDER | w32.SWP_FRAMECHANGED);
         }
     } else {
-        _ = w32.SetWindowLongW(hwnd, w32.GWL_STYLE, self.saved_style);
+        _ = w32.SetWindowLongW(hwnd, w32.GWL_STYLE, self.saved_style | w32.WS_CLIPCHILDREN);
         _ = w32.SetWindowPos(hwnd, null, self.saved_rect.left, self.saved_rect.top, self.saved_rect.right - self.saved_rect.left, self.saved_rect.bottom - self.saved_rect.top, w32.SWP_NOZORDER | w32.SWP_FRAMECHANGED);
     }
     self.is_fullscreen = !self.is_fullscreen;
@@ -2015,6 +2394,8 @@ pub fn startTabRename(self: *Window, tab_idx: usize) void {
     self.rename_window = false;
 
     const hwnd = self.hwnd orelse return;
+    // EDIT uses CS_PARENTDC and must draw into the redirected chrome.
+    const chrome = self.chrome_hwnd orelse return;
     const rect = rect: {
         if (self.tab_bar_visible) break :rect self.tab_rects[tab_idx];
 
@@ -2049,7 +2430,7 @@ pub fn startTabRename(self: *Window, tab_idx: usize) void {
         rect.top + 2,
         rect.right - rect.left - 4,
         rect.bottom - rect.top - 4,
-        hwnd,
+        chrome,
         @ptrFromInt(@as(usize, RENAME_EDIT_ID)),
         self.app.hinstance,
         null,
@@ -2093,9 +2474,10 @@ pub fn startTabRename(self: *Window, tab_idx: usize) void {
     // Select all text
     _ = w32.SendMessageW(edit, 0x00B1, 0, -1); // EM_SETSEL(0, -1)
 
-    _ = w32.SetFocus(edit);
     self.rename_edit = edit;
     self.rename_tab = tab_idx;
+    self.updateChromeRegion();
+    _ = w32.SetFocus(edit);
 }
 
 /// Prompt for an explicit top-level window title using the same lightweight
@@ -2150,6 +2532,7 @@ pub fn finishTabRename(self: *Window) void {
         _ = w32.DeleteObject(f);
         self.rename_font = null;
     }
+    self.updateChromeRegion();
     self.invalidateTabBar();
 
     // Return focus to the active surface
@@ -2169,6 +2552,7 @@ pub fn cancelTabRename(self: *Window) void {
             _ = w32.DeleteObject(f);
             self.rename_font = null;
         }
+        self.updateChromeRegion();
         if (self.getActiveSurface()) |s| {
             if (s.hwnd) |h| _ = w32.SetFocus(h);
         }
@@ -2244,6 +2628,10 @@ fn cleanupAllSurfaces(self: *Window) void {
 fn onDestroy(self: *Window) void {
     const app = self.app;
     self.tab_overview.deinit();
+    if (self.chrome_hwnd) |chrome| {
+        _ = w32.SetWindowLongPtrW(chrome, w32.GWLP_USERDATA, 0);
+        self.chrome_hwnd = null;
+    }
 
     // Quick terminal windows are managed by QuickTerminal, not the windows list.
     if (self.is_quick_terminal) {
@@ -2283,8 +2671,32 @@ fn onDestroy(self: *Window) void {
     }
 }
 
-/// Window procedure for top-level container HWNDs (GhosttyWindow class).
+/// Window procedure for the redirected chrome child.
 /// GWLP_USERDATA stores a *Window pointer.
+pub fn chromeWndProc(
+    hwnd: w32.HWND,
+    msg: u32,
+    wparam: usize,
+    lparam: isize,
+) callconv(.winapi) isize {
+    const userdata = w32.GetWindowLongPtrW(hwnd, w32.GWLP_USERDATA);
+    if (userdata == 0) return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
+    const window: *Window = @ptrFromInt(@as(usize, @bitCast(userdata)));
+    switch (msg) {
+        w32.WM_NCHITTEST => return @intCast(w32.HTTRANSPARENT),
+        w32.WM_COMMAND => {
+            const parent = window.hwnd orelse return 0;
+            return w32.SendMessageW(parent, msg, wparam, lparam);
+        },
+        w32.WM_PAINT => {
+            window.paintTabBar(hwnd);
+            return 0;
+        },
+        w32.WM_ERASEBKGND => return 1,
+        else => return w32.DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
 pub fn windowWndProc(
     hwnd: w32.HWND,
     msg: u32,
@@ -2335,6 +2747,16 @@ pub fn windowWndProc(
             window.tab_overview.refresh();
             return 0;
         },
+        w32.WM_DWMCOMPOSITIONCHANGED => {
+            window.applyComposition() catch |err| log.warn("composition setup failed: {}", .{err});
+            window.invalidateTabBar();
+            window.layoutSplits();
+            return 0;
+        },
+        w32.WM_DPICHANGED => {
+            window.handleDpiChange();
+            return 0;
+        },
         w32.WM_GETOBJECT => {
             // Opt out of MSAA accessibility for OBJID_CLIENT on the
             // top-level window too. See the matching handler in
@@ -2346,6 +2768,14 @@ pub fn windowWndProc(
             return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
         },
         w32.WM_TIMER => {
+            if (wparam == TAB_REVEAL_TIMER_ID) {
+                const idx = window.pendingTabIndex() orelse {
+                    window.cancelPendingTabReveal(null);
+                    return 0;
+                };
+                if (window.tabFramesReady(idx)) window.selectTabIndex(idx);
+                return 0;
+            }
             if (wparam == RESIZE_OVERLAY_TIMER_ID) {
                 if (window.resize_overlay_hwnd) |h| _ = w32.ShowWindow(h, w32.SW_HIDE);
                 _ = w32.KillTimer(hwnd, RESIZE_OVERLAY_TIMER_ID);
@@ -2471,7 +2901,13 @@ pub fn windowWndProc(
             return 0;
         },
         w32.WM_PAINT => {
-            window.paintTabBar();
+            if (window.chrome_hwnd) |chrome| {
+                var ps: w32.PAINTSTRUCT = undefined;
+                if (w32.BeginPaint(hwnd, &ps)) |_| _ = w32.EndPaint(hwnd, &ps);
+                _ = w32.InvalidateRect(chrome, null, 1);
+            } else {
+                window.paintTabBar(hwnd);
+            }
             return 0;
         },
         w32.WM_COMMAND => {
