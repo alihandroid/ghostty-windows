@@ -2,7 +2,7 @@ param(
     [Parameter(Mandatory)][string]$ExePath,
     [Parameter(Mandatory)][string]$ResourcesPath,
     [Parameter(Mandatory)][string]$OutputDirectory,
-    [ValidateSet('opacity', 'blur', 'creation', 'lifecycle', 'all')][string]$Case = 'all'
+    [ValidateSet('opacity', 'blur', 'chrome', 'creation', 'lifecycle', 'all')][string]$Case = 'all'
 )
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Windows.Forms, System.Drawing
@@ -47,7 +47,6 @@ public static class CompositionNative {
     [DllImport("user32.dll",CharSet=CharSet.Unicode)] static extern int GetClassName(IntPtr h,StringBuilder name,int count);
     [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h,out uint pid);
     [DllImport("user32.dll",EntryPoint="GetWindowLongPtrW")] static extern IntPtr GetWindowLongPtr(IntPtr h,int index);
-    [DllImport("user32.dll",EntryPoint="SetWindowLongPtrW",SetLastError=true)] static extern IntPtr SetWindowLongPtr(IntPtr h,int index,IntPtr value);
     [DllImport("user32.dll")] static extern bool GetGUIThreadInfo(uint thread,ref GuiThreadInfo info);
     [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr h,out Rect r);
     [DllImport("user32.dll")] static extern bool GetClientRect(IntPtr h,out Rect r);
@@ -94,6 +93,7 @@ public static class CompositionNative {
                         for(int x=0;x<r.Width;x+=8) e.Graphics.FillRectangle((x/8)%2==0?Brushes.Black:Brushes.White,x,0,8,r.Height/2);
                         for(int x=0;x<r.Width;x+=128) e.Graphics.FillRectangle((x/128)%2==0?Brushes.Black:Brushes.White,x,r.Height/2,128,r.Height);
                     }
+                    if(pattern==2)e.Graphics.FillRectangle(Brushes.Black,r);
                 };
                 backdrop.Shown+=(s,e)=> {Backdrop=backdrop.Handle;ready.Set();};
                 Application.Run(backdrop);
@@ -111,10 +111,10 @@ public static class CompositionNative {
     public static void PlaceBackdrop(IntPtr top,int mode) {
         var r=WindowRect(top);pattern=mode;
         RequireOwned(top);RequireOwned(Backdrop);
-        if(GetWindowLongPtr(top,-8)!=Backdrop&&SetWindowLongPtr(top,-8,Backdrop)==IntPtr.Zero&&Marshal.GetLastWin32Error()!=0)throw new Exception("Setting test window owner failed: "+Marshal.GetLastWin32Error());
+        // Keep the app's real ownership tree; the cross-process scene uses explicit z-order.
         backdrop.Invoke(new Action(()=> {backdrop.Bounds=new Rectangle(r.X-16,r.Y-16,r.Width+64,r.Height+64);backdrop.Invalidate();backdrop.Update();}));
         if(!SetWindowPos(Backdrop,new IntPtr(-1),r.X-16,r.Y-16,r.Width+64,r.Height+64,0x10|0x40)) throw new Exception("Positioning backdrop failed");
-        if(!SetWindowPos(top,new IntPtr(-1),0,0,0,0,0x53)) throw new Exception("Placing owned terminal above backdrop failed");
+        if(!SetWindowPos(top,new IntPtr(-1),0,0,0,0,0x253)) throw new Exception("Placing owned terminal above backdrop failed");
         BackdropRect=ClientRect(Backdrop);
     }
     public class TabTransitionFrame { public int Switch,Frame;public double Milliseconds,MaxError;public double[] Mean; }
@@ -207,7 +207,10 @@ public static class CompositionNative {
     public static void Owns(Rect r,IntPtr expected) {
         for(int y=r.Y;y<r.B;y+=4) for(int x=r.X;x<r.R;x+=4) {
             var h=WindowFromPoint(new Point{X=x,Y=y});
-            if(h==IntPtr.Zero||GetAncestor(h,2)!=expected)throw new Exception("Invalid capture: owner "+GetAncestor(h,2)+" expected "+expected+" at "+x+","+y);
+            var root=GetAncestor(h,2);uint rootPid,expectedPid;
+            GetWindowThreadProcessId(root,out rootPid);GetWindowThreadProcessId(expected,out expectedPid);
+            bool ownedPopup=rootPid==expectedPid&&GetWindowLongPtr(root,-8)==expected;
+            if(h==IntPtr.Zero||(root!=expected&&!ownedPopup))throw new Exception("Invalid capture: owner "+root+" expected "+expected+" at "+x+","+y);
         }
     }
     public static Bitmap Capture(Rect r) {
@@ -232,6 +235,7 @@ public static class CompositionNative {
     }
     public static int BackdropValue(int screenX,int screenY) {
         int x=screenX-BackdropRect.X,y=screenY-BackdropRect.Y;
+        if(pattern==2)return 0;
         if(pattern==1)return (y<BackdropRect.Height/2?x/8:x/128)%2==0?0:255;
         return x<BackdropRect.Width/2?128:255;
     }
@@ -466,6 +470,26 @@ function Check-Frame($Run,[string]$Name,[double]$Opacity,$Markers=$script:refere
     try {Assert-Background $s $Opacity $Name;if($Markers){Assert-Foreground $s $Markers $Name}} finally {$s.Bitmap.Dispose()}
 }
 function Reload($Run,[hashtable]$Values,[IntPtr]$Child=$Run.Child) {Set-Config $Run $Values;Send-Key $Child 0x7B}
+function Check-ChromeOpacity($Run,[string]$Name,[double]$Opacity,[int[]]$Ink=@(255,255,255)) {
+    $shot=Capture-Proof $Run $Name
+    try {
+        $client=[CompositionNative]::ClientRect($Run.Top)
+        $barHeight=$shot.Client.Y-$client.Y
+        Assert-Proof ($barHeight -ge 20) "$Name exposes the tab strip" @{Height=$barHeight}
+        $left=[CompositionNative]::Roi($client.X+[int]($client.Width*.38),$client.Y+2,12,2)
+        $right=[CompositionNative]::Roi($client.X+[int]($client.Width*.78),$client.Y+2,12,2)
+        [CompositionNative]::Owns($left,$Run.Top);[CompositionNative]::Owns($right,$Run.Top)
+        $a=[CompositionNative]::Mean($shot.Bitmap,$shot.Rect,$left)
+        $b=[CompositionNative]::Mean($shot.Bitmap,$shot.Rect,$right)
+        $expected=127*(1-[Math]::Round(255*$Opacity,[MidpointRounding]::AwayFromZero)/255)
+        $error=0.0
+        for($i=0;$i -lt 3;$i++){$error=[Math]::Max($error,[Math]::Abs(($b[$i]-$a[$i])-$expected))}
+        Assert-Proof ($error -le 3) "$Name tab background follows effective opacity" @{Opacity=$Opacity;MaxChannelError=$error;Gray=$a;White=$b;ExpectedContrast=$expected}
+        $label=[CompositionNative]::Roi($client.X+[int]($client.Width*.3),$client.Y+4,[int]($client.Width*.4),$barHeight-8)
+        $inkPixels=[CompositionNative]::CountColor($shot.Bitmap,$shot.Rect,$label,$Ink[0],$Ink[1],$Ink[2])
+        Assert-Proof ($inkPixels -gt 0) "$Name keeps tab label ink opaque" @{OpaquePixels=$inkPixels;Roi=$label;Color=$Ink}
+    } finally {$shot.Bitmap.Dispose()}
+}
 function Check-TabTransitions($Run,[string]$Name) {
     $s=Capture-Proof $Run ($Name+'-before')
     try {
@@ -504,7 +528,11 @@ try {
     [CompositionNative]::StartBackdrop();$script:backdropStarted=$true
     $run=Start-Ghostty 1
     $s=Capture-Proof $run 'opaque-reference'
-    try {$script:reference=Get-Markers $s;Assert-Background $s 1 'opaque-reference';Assert-Foreground $s $script:reference 'opaque-reference'} finally {$s.Bitmap.Dispose()}
+    try {
+        $script:reference=Get-Markers $s
+        Assert-Background $s 1 'opaque-reference';Assert-Foreground $s $script:reference 'opaque-reference'
+        $script:opaqueBackground=[CompositionNative]::Mean($s.Bitmap,$s.Rect,$s.Rois.gray)
+    } finally {$s.Bitmap.Dispose()}
     Stop-Ghostty $run
     if($Case -in @('opacity','all')){
         foreach($blend in @('native','linear','linear-corrected')){
@@ -526,6 +554,53 @@ try {
             Assert-Proof ($mean[1] -gt 3 -and $mean[0] -lt 252) 'Explicit cell background becomes translucent' @{Mean=$mean;Roi=$roi}
         } finally {$s.Bitmap.Dispose()}
         Stop-Ghostty $run
+    }
+    if($Case -in @('chrome','all')){
+        $run=Start-Ghostty 0.5 'native' @{'window-show-tab-bar'='always';'window-theme'='dark'}
+        Check-ChromeOpacity $run 'chrome-translucent' 0.5
+        Send-Key $run.Child 0x7A;Check-ChromeOpacity $run 'chrome-forced-opaque' 1
+        Reload $run @{'background-opacity'=0.8};Check-ChromeOpacity $run 'chrome-reload-while-forced' 1
+        Send-Key $run.Child 0x7A;Check-ChromeOpacity $run 'chrome-restored-configured' 0.8
+        Reload $run @{'background'='#ffffff';'foreground'='#1e1e2e';'window-theme'='light'}
+        Check-ChromeOpacity $run 'chrome-light' 0.8 @(30,30,46)
+        Reload $run @{'background'='#1e1e2e';'foreground'='#ffffff';'window-theme'='dark'}
+        Reload $run @{'background-opacity'=0.5}
+        $client=[CompositionNative]::ClientRect($run.Top)
+        $terminal=[CompositionNative]::ClientRect($run.Child)
+        $click=([int](($terminal.Y-$client.Y)/2) -shl 16) -bor [int]($client.Width/2)
+        [CompositionNative]::PostMessage($run.Top,0x203,[IntPtr]1,[IntPtr]$click)|Out-Null
+        Start-Sleep -Milliseconds 500
+        $editors=@([CompositionNative]::Windows($run.Process.Id,'Edit',$run.Top,$true))
+        Assert-Proof ($editors.Count -eq 1) 'Tab title editor opens over translucent strip' @{Editors=$editors.Count}
+        $editShot=Capture-Proof $run 'chrome-title-editor'
+        try {
+            $editRect=[CompositionNative]::ClientRect($editors[0])
+            $left=[CompositionNative]::Roi($editRect.X+[int]($editRect.Width*.38),$editRect.Y+3,12,2)
+            $right=[CompositionNative]::Roi($editRect.X+[int]($editRect.Width*.78),$editRect.Y+3,12,2)
+            $a=[CompositionNative]::Mean($editShot.Bitmap,$editShot.Rect,$left)
+            $b=[CompositionNative]::Mean($editShot.Bitmap,$editShot.Rect,$right)
+            $editorDifference=0.0;for($i=0;$i -lt 3;$i++){$editorDifference=[Math]::Max($editorDifference,[Math]::Abs($b[$i]-$a[$i]))}
+            Assert-Proof ($editorDifference -le 1) 'Native title editor remains opaque over different backdrops' @{MaxChannelDifference=$editorDifference;Gray=$a;White=$b;Bounds=$editRect}
+        } finally {$editShot.Bitmap.Dispose()}
+        # Escape destroys the editor on keydown; do not send keyup to its retired HWND.
+        [CompositionNative]::PostMessage($editors[0],0x100,[IntPtr]0x1B,[IntPtr]1)|Out-Null
+        Start-Sleep -Milliseconds 500
+        $remainingEditors=@([CompositionNative]::Windows($run.Process.Id,'Edit',$run.Top,$true))
+        Assert-Proof ($remainingEditors.Count -eq 0) 'Escape closes the native title editor' @{Editors=$remainingEditors.Count}
+        $script:patternMode=1
+        $shots=@()
+        foreach($state in @('false','true','false')){
+            Reload $run @{'background-blur'=$state};$shots+=,(Capture-Proof $run "chrome-blur-$state-$($shots.Count)")
+        }
+        try {
+            $client=[CompositionNative]::ClientRect($run.Top)
+            $stripe=[CompositionNative]::Roi($client.X+[int]($client.Width*.4),$client.Y+2,256,2)
+            $contrasts=@($shots|ForEach-Object{[CompositionNative]::StripeContrast($_.Bitmap,$_.Rect,$stripe)})
+            Assert-Proof ($contrasts[0] -gt 1 -and $contrasts[1] -le .7*$contrasts[0]) 'Tab strip blurs the live backdrop without fading labels' @{Contrast=$contrasts;Roi=$stripe}
+            $offError=[CompositionNative]::MaxDifference($shots[0].Bitmap,$shots[0].Rect,$shots[2].Bitmap,$shots[2].Rect,$stripe)
+            Assert-Proof ($offError -le 3) 'Disabling tab-strip blur restores background pixels' @{MaxChannelError=$offError;Roi=$stripe}
+        } finally {foreach($shot in $shots){$shot.Bitmap.Dispose()}}
+        Stop-Ghostty $run;$script:patternMode=0
     }
     if($Case -in @('blur','all')){
         $script:patternMode=1;$run=Start-Ghostty 0.5
@@ -550,6 +625,16 @@ try {
             }
         } finally {foreach($s in $shots){$s.Bitmap.Dispose()}}
         Reload $run @{'background-blur'='true'}
+        $script:patternMode=2
+        $darkShot=Capture-Proof $run 'blur-preserves-dark-theme-tint'
+        try {
+            $mean=[CompositionNative]::Mean($darkShot.Bitmap,$darkShot.Rect,$darkShot.Rois.gray)
+            $brightening=0.0
+            for($i=0;$i -lt 3;$i++){$brightening=[Math]::Max($brightening,$mean[$i]-$script:opaqueBackground[$i])}
+            Assert-Proof ($brightening -le 3) 'Blur over a black backdrop does not lighten the theme background' @{Mean=$mean;OpaqueReference=$script:opaqueBackground;MaxBrightening=$brightening}
+            Assert-Foreground $darkShot $script:reference 'blur-preserves-dark-theme-tint'
+        } finally {$darkShot.Bitmap.Dispose()}
+        $script:patternMode=1
         Send-Key $run.Child 0x53
         $s=Capture-Proof $run 'blur-live-typing-scrolling'
         try {

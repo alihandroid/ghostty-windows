@@ -52,11 +52,14 @@ The README compatibility table and roadmap track the remaining gaps.
   socket multiplexing options on Windows during terminfo installation.
 - Update all Windows executable version resources to 1.4.0.0.
 - Apply background opacity through GPU-backed DirectComposition, preserving
-  opaque text, cursors, explicit cell backgrounds, and native GDI chrome.
+  opaque text, cursors, explicit cell backgrounds, dividers, and title editors.
 - Propagate opacity reloads and forced-opaque toggles across hidden tabs,
   splits, detached tabs, new windows, and the quick terminal.
-- Accept boolean and numeric blur settings with checked Windows Acrylic or
-  accent backdrops; positive numeric values request the same OS material.
+- Share terminal opacity and blur with the tab strip while keeping labels and
+  controls opaque; hide and move the strip with its owning window.
+- Prefer untinted Windows blur-behind so dark themes avoid Desktop Acrylic's
+  added wash. Check API failures and retain OS-tinted Acrylic as a fallback.
+  Positive numeric blur values request the same OS-controlled blur radius.
 - Retain outgoing tab content until the incoming GPU frame is presented at
   its final client extent, then switch child-window visibility together.
 - Recover failed composition frames through the existing bounded WGL

@@ -11,6 +11,8 @@ const Config = @import("../../config.zig").Config;
 const App = @import("App.zig");
 const Surface = @import("Surface.zig");
 const TabOverview = @import("TabOverview.zig");
+const TabBarCanvas = @import("TabBarCanvas.zig");
+const Backdrop = @import("Backdrop.zig");
 const SplitTree = @import("../../datastruct/split_tree.zig").SplitTree;
 const w32 = @import("win32.zig");
 
@@ -20,6 +22,7 @@ const log = std.log.scoped(.win32);
 const MAX_TABS: usize = 64;
 const WM_TOGGLE_TAB_OVERVIEW = w32.WM_APP + 5;
 const WM_REFRESH_TAB_OVERVIEW = w32.WM_APP + 6;
+const WM_PAINT_TAB_BAR = w32.WM_APP + 7;
 
 /// The parent App.
 app: *App,
@@ -27,6 +30,9 @@ app: *App,
 /// The top-level window handle.
 hwnd: ?w32.HWND = null,
 chrome_hwnd: ?w32.HWND = null,
+tab_bar_hwnd: ?w32.HWND = null,
+tab_paint_pending: bool = false,
+tab_canvas: TabBarCanvas = .{},
 
 /// Tab split trees owned by this window (fixed-capacity inline array).
 tab_count: usize = 0,
@@ -172,12 +178,7 @@ pub fn systemUsesLightTheme() bool {
     return val != 0; // 0 = dark, nonzero = light
 }
 
-/// Apply the DWM dark/light title bar, honoring `window-theme`: dark/light
-/// force the mode, `system` reads the OS apps theme, and `auto`/`ghostty`
-/// fall back to the terminal background luminance. The caption is tinted to
-/// the terminal background only for the luminance-derived themes; for the
-/// explicit dark/light/system themes the caption is reset to the system
-/// default so the standard themed title bar (and legible glyphs) is drawn.
+/// Explicit window themes use the OS caption color; auto follows terminal luminance.
 fn applyChromeTheme(hwnd: w32.HWND, theme: anytype, bg: anytype) void {
     const luminance: f32 = (0.2126 * @as(f32, @floatFromInt(bg.r)) +
         0.7152 * @as(f32, @floatFromInt(bg.g)) +
@@ -233,29 +234,7 @@ fn applyBackgroundBlur(self: *Window) void {
         self.opacity_mode == .configured and
         self.app.config.@"background-opacity" < 1 and
         self.app.config.@"background-blur".enabled();
-    const backdrop: u32 = if (enabled) w32.DWMSBT_TRANSIENTWINDOW else w32.DWMSBT_NONE;
-    const result = w32.DwmSetWindowAttribute(
-        hwnd,
-        w32.DWMWA_SYSTEMBACKDROP_TYPE,
-        &backdrop,
-        @sizeOf(u32),
-    );
-    if (result >= 0) return;
-
-    var policy: w32.ACCENT_POLICY = .{
-        .AccentState = if (enabled) w32.ACCENT_ENABLE_BLURBEHIND else w32.ACCENT_DISABLED,
-        .AccentFlags = 0,
-        .GradientColor = 0,
-        .AnimationId = 0,
-    };
-    var data: w32.WINDOWCOMPOSITIONATTRIBDATA = .{
-        .Attrib = w32.WCA_ACCENT_POLICY,
-        .pvData = &policy,
-        .cbData = @sizeOf(w32.ACCENT_POLICY),
-    };
-    if (w32.SetWindowCompositionAttribute(hwnd, &data) == 0) {
-        log.warn("Windows background blur unavailable (DwmSetWindowAttribute HRESULT=0x{x}, SetWindowCompositionAttribute returned FALSE)", .{@as(u32, @bitCast(result))});
-    }
+    Backdrop.apply(hwnd, enabled);
 }
 
 fn applyComposition(self: *Window) !void {
@@ -293,6 +272,7 @@ pub fn refreshOpacity(self: *Window) void {
         }
     }
     self.tab_overview.updateAppearance();
+    self.invalidateTabBar();
 }
 
 pub fn surfaceHwndReplaced(self: *Window, old: w32.HWND, new: w32.HWND) void {
@@ -377,6 +357,12 @@ pub fn init(self: *Window, app: *App, options: InitOptions) !void {
 
     self.hwnd = hwnd;
     errdefer {
+        self.tab_canvas.deinit();
+        if (self.tab_bar_hwnd) |bar| {
+            _ = w32.SetWindowLongPtrW(bar, w32.GWLP_USERDATA, 0);
+            _ = w32.DestroyWindow(bar);
+            self.tab_bar_hwnd = null;
+        }
         if (self.chrome_hwnd) |chrome| {
             _ = w32.SetWindowLongPtrW(chrome, w32.GWLP_USERDATA, 0);
             _ = w32.DestroyWindow(chrome);
@@ -403,12 +389,29 @@ pub fn init(self: *Window, app: *App, options: InitOptions) !void {
     // Give GDI chrome its own redirection surface under the nonredirected parent.
     if (w32.SetLayeredWindowAttributes(chrome, 0, 255, w32.LWA_ALPHA) == 0)
         return error.Win32Error;
+    // Owned layers remain visible where this no-redirection parent drops layered-child pixels.
+    const tab_bar = w32.CreateWindowExW(
+        w32.WS_EX_LAYERED | w32.WS_EX_TOOLWINDOW | w32.WS_EX_NOACTIVATE,
+        App.CHROME_CLASS_NAME,
+        std.unicode.utf8ToUtf16LeStringLiteral(""),
+        w32.WS_POPUP,
+        0,
+        0,
+        0,
+        0,
+        hwnd,
+        null,
+        app.hinstance,
+        null,
+    ) orelse return error.Win32Error;
+    self.tab_bar_hwnd = tab_bar;
     _ = w32.SetWindowLongPtrW(hwnd, w32.GWLP_USERDATA, @bitCast(@intFromPtr(self)));
     _ = w32.SetWindowLongPtrW(chrome, w32.GWLP_USERDATA, @bitCast(@intFromPtr(self)));
+    _ = w32.SetWindowLongPtrW(tab_bar, w32.GWLP_USERDATA, @bitCast(@intFromPtr(self)));
     self.updateChromeRegion();
 
-    self.applyComposition() catch |err| log.warn("composition setup failed: {}", .{err});
     applyChromeTheme(hwnd, app.config.@"window-theme", app.config.background);
+    self.applyComposition() catch |err| log.warn("composition setup failed: {}", .{err});
 
     // Apply dark theme to common controls (scrollbar, etc.).
     _ = w32.SetWindowTheme(
@@ -437,7 +440,7 @@ pub fn init(self: *Window, app: *App, options: InitOptions) !void {
         w32.DEFAULT_CHARSET, // iCharSet
         0, // iOutPrecision
         0, // iClipPrecision
-        0, // iQuality
+        4, // Grayscale antialiasing remains valid over a translucent background.
         0, // iPitchAndFamily
         std.unicode.utf8ToUtf16LeStringLiteral("Segoe UI"),
     );
@@ -466,7 +469,7 @@ fn handleDpiChange(self: *Window) void {
         w32.DEFAULT_CHARSET,
         0,
         0,
-        0,
+        4,
         0,
         std.unicode.utf8ToUtf16LeStringLiteral("Segoe UI"),
     );
@@ -477,6 +480,12 @@ fn handleDpiChange(self: *Window) void {
 pub fn deinit(self: *Window) void {
     self.tab_overview.deinit();
     self.cleanupAllSurfaces();
+    self.tab_canvas.deinit();
+    if (self.tab_bar_hwnd) |bar| {
+        _ = w32.SetWindowLongPtrW(bar, w32.GWLP_USERDATA, 0);
+        _ = w32.DestroyWindow(bar);
+        self.tab_bar_hwnd = null;
+    }
     if (self.tab_font) |font| {
         _ = w32.DeleteObject(font);
         self.tab_font = null;
@@ -1026,6 +1035,34 @@ pub fn layoutSplits(self: *Window) void {
     self.applyBackgroundBlur();
 }
 
+fn positionTabBar(self: *Window, visible: bool) void {
+    const parent = self.hwnd orelse return;
+    const bar = self.tab_bar_hwnd orelse return;
+    var client: w32.RECT = undefined;
+    var origin = w32.POINT{ .x = 0, .y = 0 };
+    if (w32.GetClientRect(parent, &client) == 0 or w32.ClientToScreen(parent, &origin) == 0) return;
+    const height = self.tabBarHeight();
+    const show = visible and height > 0 and !self.closing;
+    const visibility: u32 = if (show) w32.SWP_SHOWWINDOW else w32.SWP_HIDEWINDOW;
+    var after: ?w32.HWND = null;
+    if (show) {
+        var previous = w32.GetWindow(parent, w32.GW_HWNDPREV);
+        if (previous == bar) previous = w32.GetWindow(bar, w32.GW_HWNDPREV);
+        const topmost = w32.GetWindowLongW(parent, w32.GWL_EXSTYLE) & w32.WS_EX_TOPMOST != 0;
+        const band = if (topmost) w32.HWND_TOPMOST else w32.HWND_NOTOPMOST;
+        after = if (previous) |p|
+            if ((w32.GetWindowLongW(p, w32.GWL_EXSTYLE) & w32.WS_EX_TOPMOST != 0) == topmost) p else band
+        else
+            band;
+    }
+    // Match the owner's z-order without raising it or covering unrelated apps.
+    const flags = w32.SWP_NOACTIVATE | w32.SWP_NOOWNERZORDER | visibility |
+        (if (show) @as(u32, 0) else w32.SWP_NOZORDER);
+    if (w32.SetWindowPos(bar, after, origin.x, origin.y, client.right - client.left, height, flags) == 0) {
+        log.warn("could not position translucent tab strip", .{});
+    }
+}
+
 fn updateChromeRegion(self: *Window) void {
     const parent = self.hwnd orelse return;
     const chrome = self.chrome_hwnd orelse return;
@@ -1038,6 +1075,9 @@ fn updateChromeRegion(self: *Window) void {
         log.warn("could not size composition chrome", .{});
         return;
     }
+    const bar_height = self.tabBarHeight();
+    self.positionTabBar(self.isVisible());
+    self.invalidateTabBar();
 
     const region = w32.CreateRectRgn(0, 0, width, height) orelse {
         log.warn("could not allocate composition chrome region", .{});
@@ -1046,6 +1086,19 @@ fn updateChromeRegion(self: *Window) void {
     var owned = false;
     defer {
         if (!owned) _ = w32.DeleteObject(region);
+    }
+    const tab_region = w32.CreateRectRgn(0, 0, width, bar_height) orelse return;
+    var tab_region_owned = false;
+    defer {
+        if (!tab_region_owned) _ = w32.DeleteObject(tab_region);
+    }
+    if (bar_height > 0) {
+        const bar_region = w32.CreateRectRgn(0, 0, width, bar_height) orelse return;
+        defer _ = w32.DeleteObject(bar_region);
+        if (w32.CombineRgn(region, region, bar_region, w32.RGN_DIFF) == 0) {
+            log.warn("could not exclude translucent tab strip from opaque chrome", .{});
+            return;
+        }
     }
     if (self.tab_count > 0) {
         const displayed = self.displayedTabIndex() orelse self.active_tab;
@@ -1109,11 +1162,22 @@ fn updateChromeRegion(self: *Window) void {
             log.warn("could not include composition title editor region", .{});
             return;
         }
+        if (w32.CombineRgn(tab_region, tab_region, overlay, w32.RGN_DIFF) == 0) {
+            log.warn("could not expose native title editor through tab strip", .{});
+            return;
+        }
     }
     if (w32.SetWindowRgn(chrome, region, 1) != 0) {
         owned = true;
     } else {
         log.warn("could not apply composition chrome region", .{});
+    }
+    if (self.tab_bar_hwnd) |bar| {
+        if (w32.SetWindowRgn(bar, tab_region, 1) != 0) {
+            tab_region_owned = true;
+        } else {
+            log.warn("could not apply translucent tab strip region", .{});
+        }
     }
     _ = w32.InvalidateRect(chrome, null, 1);
 }
@@ -1677,6 +1741,12 @@ pub fn invalidateTabBar(self: *Window) void {
     if (self.tab_overview.active and !self.overview_refresh_pending) {
         self.overview_refresh_pending = w32.PostMessageW(hwnd, WM_REFRESH_TAB_OVERVIEW, 0, 0) != 0;
     }
+    if (self.tab_bar_hwnd) |bar| {
+        // A layered HWND needs its first pixels before Windows will paint it.
+        if (!self.tab_paint_pending) {
+            self.tab_paint_pending = w32.PostMessageW(bar, WM_PAINT_TAB_BAR, 0, 0) != 0;
+        }
+    }
     if (self.chrome_hwnd) |chrome| {
         _ = w32.InvalidateRect(chrome, null, 1);
         return;
@@ -1765,36 +1835,23 @@ fn tabCloseRect(self: *const Window, tab: w32.RECT) w32.RECT {
     return .{ .left = tab.right - inset - size, .top = top, .right = tab.right - inset, .bottom = top + size };
 }
 
-/// Paint the tab bar using double-buffered GDI painting.
-/// Draws tab backgrounds, text labels, close buttons (x), and the new-tab (+) button.
 fn paintTabBar(self: *Window, hwnd: w32.HWND) void {
-    var ps: w32.PAINTSTRUCT = undefined;
-    const hdc_screen = w32.BeginPaint(hwnd, &ps) orelse return;
-    defer _ = w32.EndPaint(hwnd, &ps);
-
-    // If the tab bar is not visible, just validate the region and return.
-    if (!self.tab_bar_visible) {
-        self.paintDividers(hdc_screen);
-        return;
-    }
+    if (!self.tab_bar_visible) return;
 
     const bar_h = self.tabBarHeight();
-    if (bar_h <= 0) return;
-
-    // Get client rect width.
     var client_rect: w32.RECT = undefined;
-    if (w32.GetClientRect(hwnd, &client_rect) == 0) return;
+    if (bar_h <= 0 or w32.GetClientRect(hwnd, &client_rect) == 0) return;
     const client_w = client_rect.right - client_rect.left;
     if (client_w <= 0) return;
-
-    const mem_dc = w32.CreateCompatibleDC(hdc_screen) orelse return;
-    defer _ = w32.DeleteDC(mem_dc);
-    const mem_bmp = w32.CreateCompatibleBitmap(hdc_screen, client_w, bar_h) orelse return;
-    const old_bmp = w32.SelectObject(mem_dc, mem_bmp);
-    defer {
-        _ = w32.SelectObject(mem_dc, old_bmp);
-        _ = w32.DeleteObject(mem_bmp);
-    }
+    const opacity = if (self.getActiveSurface()) |surface|
+        surface.backgroundOpacityOverride() orelse self.app.config.@"background-opacity"
+    else
+        1;
+    const canvas = &self.tab_canvas;
+    canvas.begin(client_w, bar_h, self.tab_font, opacity) catch |err| {
+        log.warn("could not prepare tab strip pixels err={}", .{err});
+        return;
+    };
 
     const bg = self.app.config.background;
     const fg = self.app.config.foreground;
@@ -1804,31 +1861,14 @@ fn paintTabBar(self: *Window, hwnd: w32.HWND) void {
     const divider_color = tabColor(bg, fg, 40);
     const active_text_color = w32.RGB(fg.r, fg.g, fg.b);
     const inactive_text_color = tabColor(bg, fg, 195);
-    const brush: w32.HBRUSH = @ptrCast(w32.GetStockObject(w32.DC_BRUSH) orelse return);
+    const bar_rect = w32.RECT{ .left = 0, .top = 0, .right = client_w, .bottom = bar_h };
+    canvas.fillRect(&bar_rect, bar_color);
 
-    // --- Fill bar background ---
-    var bar_rect = w32.RECT{ .left = 0, .top = 0, .right = client_w, .bottom = bar_h };
-    _ = w32.SetDCBrushColor(mem_dc, bar_color);
-    _ = w32.FillRect(mem_dc, &bar_rect, brush);
-
-    // --- Select font and set text mode ---
-    var old_font: ?*anyopaque = null;
-    if (self.tab_font) |font| {
-        old_font = w32.SelectObject(mem_dc, font);
-    }
-    defer {
-        if (old_font) |f| _ = w32.SelectObject(mem_dc, f);
-    }
-    _ = w32.SetBkMode(mem_dc, w32.TRANSPARENT);
-
-    // --- Calculate tab geometry ---
     const new_tab_btn_w: i32 = @intFromFloat(@round(36.0 * self.scale));
     const title_pad: i32 = @intFromFloat(@round(28.0 * self.scale));
     const divider_w: i32 = @max(1, @as(i32, @intFromFloat(@round(self.scale))));
     const divider_inset: i32 = @intFromFloat(@round(8.0 * self.scale));
-
     const available_w = client_w - new_tab_btn_w;
-
     const min_tab_w: i32 = @intFromFloat(@round(60.0 * self.scale));
     const tabs_right = layoutTabRects(
         self.tab_rects[0..self.tab_count],
@@ -1837,105 +1877,70 @@ fn paintTabBar(self: *Window, hwnd: w32.HWND) void {
         min_tab_w,
     );
 
-    // --- Draw each tab ---
     for (0..self.tab_count) |i| {
-        const is_active = (i == self.active_tab);
-        const is_hovered = (@as(isize, @intCast(i)) == self.hover_tab);
+        const is_active = i == self.active_tab;
+        const is_hovered = @as(isize, @intCast(i)) == self.hover_tab;
         const x = self.tab_rects[i].left;
         const this_tab_w = self.tab_rects[i].right - x;
-
         if (is_active) {
-            _ = w32.SetDCBrushColor(mem_dc, active_bg_color);
-            _ = w32.FillRect(mem_dc, &self.tab_rects[i], brush);
+            canvas.fillRect(&self.tab_rects[i], active_bg_color);
         } else if (is_hovered) {
-            _ = w32.SetDCBrushColor(mem_dc, hover_color);
-            _ = w32.FillRect(mem_dc, &self.tab_rects[i], brush);
+            canvas.fillRect(&self.tab_rects[i], hover_color);
         }
         if (i > 0) {
-            var divider = w32.RECT{
+            const divider = w32.RECT{
                 .left = x,
                 .top = divider_inset,
                 .right = x + divider_w,
                 .bottom = bar_h - divider_inset,
             };
-            _ = w32.SetDCBrushColor(mem_dc, divider_color);
-            _ = w32.FillRect(mem_dc, &divider, brush);
+            canvas.fillRect(&divider, divider_color);
         }
-
-        // Draw tab title text.
         const title_len = self.tab_title_lens[i];
         if (title_len > 0) {
-            _ = w32.SetTextColor(mem_dc, if (is_active) active_text_color else inactive_text_color);
             var text_rect = w32.RECT{
                 .left = x + title_pad,
                 .top = 0,
                 .right = x + this_tab_w - title_pad,
                 .bottom = bar_h,
             };
-            _ = w32.DrawTextW(
-                mem_dc,
+            canvas.drawText(
                 @ptrCast(&self.tab_titles[i]),
                 @intCast(title_len),
                 &text_rect,
                 w32.DT_CENTER | w32.DT_VCENTER | w32.DT_SINGLELINE | w32.DT_END_ELLIPSIS | w32.DT_NOPREFIX,
+                if (is_active) active_text_color else inactive_text_color,
             );
         }
-
         if (is_hovered) {
             var close_rect = self.tabCloseRect(self.tab_rects[i]);
-            if (self.hover_close) {
-                _ = w32.SetDCBrushColor(mem_dc, divider_color);
-                _ = w32.FillRect(mem_dc, &close_rect, brush);
-            }
-            _ = w32.SetTextColor(mem_dc, if (self.hover_close) active_text_color else inactive_text_color);
-            const x_char = std.unicode.utf8ToUtf16LeStringLiteral("\u{00D7}");
-            _ = w32.DrawTextW(
-                mem_dc,
-                x_char,
+            if (self.hover_close) canvas.fillRect(&close_rect, divider_color);
+            canvas.drawText(
+                std.unicode.utf8ToUtf16LeStringLiteral("\u{00D7}"),
                 1,
                 &close_rect,
                 w32.DT_CENTER | w32.DT_VCENTER | w32.DT_SINGLELINE | w32.DT_NOPREFIX,
+                if (self.hover_close) active_text_color else inactive_text_color,
             );
         }
     }
 
-    // --- Draw new-tab (+) button ---
-    {
-        const btn_left = tabs_right;
-        const btn_right = btn_left + new_tab_btn_w;
-        self.new_tab_rect = w32.RECT{
-            .left = btn_left,
-            .top = 0,
-            .right = btn_right,
-            .bottom = bar_h,
-        };
-
-        // Hover highlight for new-tab button.
-        if (self.hover_new_tab) {
-            var btn_rect = w32.RECT{ .left = btn_left, .top = 0, .right = btn_right, .bottom = bar_h };
-            _ = w32.SetDCBrushColor(mem_dc, hover_color);
-            _ = w32.FillRect(mem_dc, &btn_rect, brush);
-        }
-
-        _ = w32.SetTextColor(mem_dc, inactive_text_color);
-        const plus_char = std.unicode.utf8ToUtf16LeStringLiteral("+");
-        var plus_rect = w32.RECT{
-            .left = btn_left,
-            .top = 0,
-            .right = btn_right,
-            .bottom = bar_h,
-        };
-        _ = w32.DrawTextW(
-            mem_dc,
-            plus_char,
-            1,
-            &plus_rect,
-            w32.DT_CENTER | w32.DT_VCENTER | w32.DT_SINGLELINE | w32.DT_NOPREFIX,
-        );
-    }
-
-    _ = w32.BitBlt(hdc_screen, 0, 0, client_w, bar_h, mem_dc, 0, 0, w32.SRCCOPY);
-    self.paintDividers(hdc_screen);
+    self.new_tab_rect = .{
+        .left = tabs_right,
+        .top = 0,
+        .right = tabs_right + new_tab_btn_w,
+        .bottom = bar_h,
+    };
+    if (self.hover_new_tab) canvas.fillRect(&self.new_tab_rect, hover_color);
+    var plus_rect = self.new_tab_rect;
+    canvas.drawText(
+        std.unicode.utf8ToUtf16LeStringLiteral("+"),
+        1,
+        &plus_rect,
+        w32.DT_CENTER | w32.DT_VCENTER | w32.DT_SINGLELINE | w32.DT_NOPREFIX,
+        inactive_text_color,
+    );
+    canvas.present(hwnd) catch |err| log.warn("could not present translucent tab strip err={}", .{err});
 }
 
 /// Honor a program's CSI 8 t resize only when it owns the whole window.
@@ -2628,6 +2633,11 @@ fn cleanupAllSurfaces(self: *Window) void {
 fn onDestroy(self: *Window) void {
     const app = self.app;
     self.tab_overview.deinit();
+    self.tab_canvas.deinit();
+    if (self.tab_bar_hwnd) |bar| {
+        _ = w32.SetWindowLongPtrW(bar, w32.GWLP_USERDATA, 0);
+        self.tab_bar_hwnd = null;
+    }
     if (self.chrome_hwnd) |chrome| {
         _ = w32.SetWindowLongPtrW(chrome, w32.GWLP_USERDATA, 0);
         self.chrome_hwnd = null;
@@ -2688,8 +2698,17 @@ pub fn chromeWndProc(
             const parent = window.hwnd orelse return 0;
             return w32.SendMessageW(parent, msg, wparam, lparam);
         },
-        w32.WM_PAINT => {
+        WM_PAINT_TAB_BAR => {
+            window.tab_paint_pending = false;
             window.paintTabBar(hwnd);
+            return 0;
+        },
+        w32.WM_PAINT => {
+            var ps: w32.PAINTSTRUCT = undefined;
+            if (w32.BeginPaint(hwnd, &ps)) |dc| {
+                if (window.tab_bar_hwnd != hwnd) window.paintDividers(dc);
+                _ = w32.EndPaint(hwnd, &ps);
+            }
             return 0;
         },
         w32.WM_ERASEBKGND => return 1,
@@ -2753,6 +2772,13 @@ pub fn windowWndProc(
             window.layoutSplits();
             return 0;
         },
+        w32.WM_WINDOWPOSCHANGED => {
+            const position: *const w32.WINDOWPOS = @ptrFromInt(@as(usize, @bitCast(lparam)));
+            const z_order_changed = position.flags & w32.SWP_NOZORDER == 0;
+            const result = w32.DefWindowProcW(hwnd, msg, wparam, lparam);
+            if (z_order_changed) window.positionTabBar(window.isVisible());
+            return result;
+        },
         w32.WM_DPICHANGED => {
             window.handleDpiChange();
             return 0;
@@ -2802,6 +2828,7 @@ pub fn windowWndProc(
             // new state rather than querying the old native style. This also
             // covers quick-terminal animation completion and app hide/show.
             window.setActiveTabVisible(wparam != 0 and w32.IsIconic(hwnd) == 0);
+            window.positionTabBar(wparam != 0 and w32.IsIconic(hwnd) == 0);
             return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
         },
 
@@ -2813,6 +2840,7 @@ pub fn windowWndProc(
             // collapse the grid, and the resize overlay would flash offscreen.
             if (wparam == w32.SIZE_MINIMIZED) {
                 window.setActiveTabVisible(false);
+                window.positionTabBar(false);
                 return 0;
             }
             if (wparam == w32.SIZE_RESTORED or wparam == w32.SIZE_MAXIMIZED) {
@@ -2845,6 +2873,7 @@ pub fn windowWndProc(
             return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
         },
         w32.WM_MOVE => {
+            window.positionTabBar(window.isVisible());
             // Top-level move: child surface HWNDs do NOT receive WM_MOVE
             // (their position relative to the parent is unchanged), but the
             // scrollbar is a screen-positioned popup that must follow its
@@ -2901,13 +2930,9 @@ pub fn windowWndProc(
             return 0;
         },
         w32.WM_PAINT => {
-            if (window.chrome_hwnd) |chrome| {
-                var ps: w32.PAINTSTRUCT = undefined;
-                if (w32.BeginPaint(hwnd, &ps)) |_| _ = w32.EndPaint(hwnd, &ps);
-                _ = w32.InvalidateRect(chrome, null, 1);
-            } else {
-                window.paintTabBar(hwnd);
-            }
+            var ps: w32.PAINTSTRUCT = undefined;
+            if (w32.BeginPaint(hwnd, &ps)) |_| _ = w32.EndPaint(hwnd, &ps);
+            window.invalidateTabBar();
             return 0;
         },
         w32.WM_COMMAND => {

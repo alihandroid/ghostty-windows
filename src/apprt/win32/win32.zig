@@ -105,6 +105,7 @@ pub const GWL_EXSTYLE: i32 = -20;
 pub const SWP_NOSIZE: u32 = 0x0001;
 pub const SWP_NOMOVE: u32 = 0x0002;
 pub const SWP_NOZORDER: u32 = 0x0004;
+pub const SWP_NOOWNERZORDER: u32 = 0x0200;
 pub const SWP_FRAMECHANGED: u32 = 0x0020;
 pub const SWP_HIDEWINDOW: u32 = 0x0080;
 
@@ -133,6 +134,7 @@ pub const SIZE_RESTORED: usize = 0;
 pub const SIZE_MINIMIZED: usize = 1;
 pub const SIZE_MAXIMIZED: usize = 2;
 pub const WM_MOVE: u32 = 0x0003;
+pub const WM_WINDOWPOSCHANGED: u32 = 0x0047;
 pub const WM_SETFOCUS: u32 = 0x0007;
 pub const WM_KILLFOCUS: u32 = 0x0008;
 pub const WM_GETOBJECT: u32 = 0x003D;
@@ -581,6 +583,17 @@ pub extern "user32" fn GetWindowRect(
     hWnd: HWND,
     lpRect: *RECT,
 ) callconv(.winapi) i32;
+pub const GW_HWNDPREV: u32 = 3;
+pub extern "user32" fn GetWindow(hwnd: HWND, command: u32) callconv(.winapi) ?HWND;
+pub const WINDOWPOS = extern struct {
+    hwnd: HWND,
+    hwndInsertAfter: ?HWND,
+    x: i32,
+    y: i32,
+    cx: i32,
+    cy: i32,
+    flags: u32,
+};
 
 pub extern "user32" fn MonitorFromWindow(
     hwnd: HWND,
@@ -1166,6 +1179,7 @@ pub extern "gdi32" fn CombineRgn(dest: HRGN, src1: HRGN, src2: HRGN, mode: i32) 
 pub extern "user32" fn SetWindowRgn(hwnd: HWND, region: ?HRGN, redraw: i32) callconv(.winapi) i32;
 pub extern "user32" fn MapWindowPoints(from: ?HWND, to: ?HWND, points: *POINT, count: u32) callconv(.winapi) i32;
 pub extern "kernel32" fn SetLastError(code: u32) callconv(.winapi) void;
+pub extern "gdi32" fn GdiFlush() callconv(.winapi) i32;
 pub extern "gdi32" fn StretchDIBits(
     hdc: HDC,
     xDest: i32,
